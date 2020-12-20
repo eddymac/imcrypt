@@ -1,0 +1,4352 @@
+<!DOCTYPE html>
+<html>
+<!--
+IMCrypt Routines
+
+This program is released under the GPL V2 and GPL V3
+
+High grade encryption designed to be used over instant messaging.
+
+Technical details:
+Hashing algorithm - SHA 256
+Ciphering - AES 256
+Public/Private Key - Eliptical Curve secp256k1 - then ECDH and ECDSA
+-->
+    <head>
+        <meta charset="utf-8">
+        <title>IM Cryptography Utilities</title>
+        <meta name="viewport" content="initial-scale=1">
+<style>
+.tentry {
+    border-width: 1px;
+    border-style: solid;
+    border-color: grey;
+}
+
+.ttitle {
+    font-size: 80%;
+}
+
+.tfield {
+    min-height: 1EM;
+    padding: 5px;
+}
+.texthide {
+    color: grey;
+    background-color: grey;
+}
+.texthide::selection {
+    color: red;
+    background-color: red;
+}
+.publickey {
+    width: 30em;
+    background-color: white;
+    color: black;
+}
+
+#ii_intro {
+    border: 4px;;
+    border-color: green;
+    border-style: solid;
+    display: block;
+    padding: 5px;
+}
+#ii_rest {
+    display: none;
+}
+#mm_options {
+    font-size: 120%;
+}
+.secrets {
+    border: 2px;
+    border-color: black;
+    border-style: solid;
+}
+.fingureprint {
+    font-family: monospace;
+}
+.nameid {
+    width: 25em;
+}
+
+.password {
+    width: 20em;
+}
+.optdiv {
+    /* display: none; */
+}
+</style>
+
+<script type="text/javascript" >
+ "use strict";
+ /*
+ Everything in do_onload and have all
+ dynamic variables as a closure in an attempt to
+ make XSS attacks harder
+ */
+ 
+ // Some general utilities used almost everywhere
+ function do_onload()
+ {
+   const INCRYPT_VERSION = 1;    // Integer less that 127
+ 
+   function dummy(x) { }     // putting stuff on stack to discard
+ 
+   function debug()
+   {
+     const divd = document.getElementById("debug");
+     if(arguments.length == 0) {
+       divd.innerText = "";
+     } else {
+       divd.innerHTML += "<br />"
+       for(let i = 0; i < arguments.length; i++) {
+         document.getElementById("debug").innerHTML += arguments[i].toString() + ",";
+       }
+     }
+   }
+ 
+ 
+ 
+ 
+   /*
+   A File class to handle reading and writing of files in one place
+   A bit mucky, as same class handles both reading and writing, only
+   need to update when required.  The "data" and "name" are public
+   properties
+ 
+   Constructor arguments  are Input file control, file read button, and output link
+   */
+ 
+   class File {
+     constructor (infile, outfile, outsave, doonchoose)
+     {
+       this.data = null;
+       this.name = "";
+ 
+       this.outfile = outfile;
+       this.outsave = outsave
+       this.infile = infile;
+       this.doonchoose = doonchoose
+       this.url = null;
+       this.mode = 0;    // 1 = Has read, 2 = Ready to write
+ 
+       this.clearin();
+       this.clearout();
+ 
+       let self = this;
+ 
+       infile.addEventListener("change", function(e)
+       {
+         self.clearout();
+         self.mode = 0;
+         let fileobj = infile.files[0];
+         if(!fileobj) {
+           alert("No file selected");
+           return;
+         }
+         self.read(fileobj);
+       });
+     }
+ 
+     clearin()
+     {
+       // Should work.....
+       this.infile.value = null;
+     }
+ 
+     clearout()
+     {
+       if(this.url !== null) {
+         URL.revokeObjectURL(this.url);
+         this.url = null;
+       }
+       if(this.outfile) {
+         this.outfile.href = "#";
+         this.outfile.download = "";
+         this.outsave.innerText = "Save";
+         this.outsave.disabled = true;
+       }
+     }
+ 
+     reset()
+     {
+       this.clearin();
+       this.clearout();
+       this.data = null;
+       this.name = "";
+     }
+ 
+     read(fileobj)
+     {
+       if(this.doonchoose) this.doonchoose();
+       let reader = new FileReader();
+       let self = this;
+       reader.onload = function(e) {
+         self.data = new Uint8Array(reader.result);
+         self.name = fileobj.name;
+         self.mode = 1;
+         alert("Data loaded");
+       }
+       reader.readAsArrayBuffer(fileobj);
+     }
+     toUrl()
+     {
+       this.clearout();
+       if(this.data === null) return null;
+       this.url = URL.createObjectURL(new Blob([this.data], {type: "application/octet-stream"}));
+       this.outfile.href = this.url;
+       this.outfile.download = this.name;
+       this.outsave.disabled = false;
+       this.outsave.innerText = "Save: " + this.name;
+       this.clearin();
+       this.mode = 2;
+     }
+     decrypt(key, cblock)
+     {
+       let isname = true;
+       this.name = "";
+       const outbbs = new Array();
+       const outname = new Array();
+ 
+       function _out(arr)
+       {
+         for(let b of arr) {
+           if(isname) {
+             if(b == 0) {
+               isname = false;
+             } else if(outname.length > 100) {
+               throw("Decrypted file seems too long - aborting");
+             } else {
+               outname.push(b);
+             }
+           } else {
+             outbbs.push(b);
+           }
+         }
+       }
+ 
+       let blk = AES.getDecode(key, _out, this.data);
+       if(cblock) cblock.value = blk.ciphernum.toString();
+       blk.put_bytes(this.data);
+       blk.end();
+       const self = this;
+       toUTF16(function(c) {self.name += c;}, outname);
+       this.data = new Uint8Array(outbbs);
+       this.outsave.innerText = this.name;
+       this.toUrl();
+     }
+     encrypt(key, ciphernum)
+     {
+       const iv = entropy.getblock();
+ 
+       if(this.mode != 1) {
+         alert("Please read file before encryption");
+         return;
+       }
+ 
+       iv[0] = 1;
+       iv[1] = Number(ciphernum) << 5;
+ 
+       let outbss = new Array()
+       function _out(blk)
+       {
+         for(let b of blk) outbss.push(b);
+       }
+       let blk = AES.getEncode(ciphernum, key, _out);
+   
+       function _in(b)
+       {
+         blk.put_byte(b);
+       }
+       fromUTF16(_in, this.name);
+       blk.put_byte(0);
+       blk.put_bytes(this.data);
+       blk.end();
+       this.data = new Uint8Array(outbss);
+       this.name = Date.now().toString() + ".imc";
+       this.toUrl();
+     }
+   }
+ 
+ 
+   const LBigint = function ()
+   {
+     /*
+     * LBigint class
+     * Arbitary precisions for integers
+     */
+ 
+     const DIGIT_ZERO=[]
+     const NUM_ONE=1n;
+     const NUM_TWO=2n;
+     const NUM_THREE=3n;
+     const NUM_FOUR=4n;
+     const NUM_INVALID = -1n;
+     
+     class LBigint {
+       constructor(inp)
+       {
+         this.a_num = 0n;
+         this.a_neg = false;
+     
+         if(inp instanceof LBigint) {
+           this.a_num = inp.a_num;
+           this.a_neg = inp.a_neg;
+         } else if (typeof inp == 'bigint') {
+           if (inp < 0n) {
+             this.a_num = 0n - inp;
+             this.a_neg = true;
+           } else {
+             this.a_num = inp;
+           }
+         } else if (typeof inp == "undefined") {
+           this.fromnumber(0);
+         } else if (inp instanceof Array) {
+           this.a_num = LBigint._strfromarray(inp);
+         } else if (Number.isFinite(inp)) {
+           this.fromnumber(Math.round(inp));
+         } else {
+           this.fromstr(inp.toString())
+         }
+       }
+     
+       fromnumber(inp)
+       {
+         if(inp < 0) {
+           this.a_neg = true;
+           inp = 0 - inp;
+         } else {
+           this.a_neg = false;
+         }
+         this.a_num = LBigint._strfromnumber(inp);
+         return this;
+       }
+     
+       fromstr(inp)
+       {
+         const slen = inp.length;
+         if (slen == 0) {
+           this.a_neg = false;
+           this.a_num = new Array();
+         } else {
+           if (inp[0] == "-") {
+             this.a_neg = true;
+             this.a_num = LBigint._strfromhex(inp.substring(1));
+           } else {
+             this.a_neg = false;
+             this.a_num = LBigint._strfromhex(inp.substring(0));
+           }
+         }
+         return this;
+       }
+       copy()
+       {
+         return new LBigint(this);
+       }
+     
+       static copyit(a)
+       {
+         if(a instanceof LBigint)
+           return a.copy();
+         else
+           return a;
+       }
+ 
+       abs()
+       {
+         this.a_neg = false;
+         return this;
+       }
+     
+       add(other)
+       {
+         if (this.a_neg != other.a_neg) {
+           const tout = LBigint._strsub(this.a_num, other.a_num);
+           if(tout[1]) this.a_neg = (!this.a_neg);
+           this.a_num = tout[0];
+         } else {
+           this.a_num = LBigint._stradd(other.a_num, this.a_num);
+         }
+         return this;
+       }
+     
+       subtract(other)
+       {
+         if (this.a_neg != other.a_neg)
+         {
+           this.a_num = LBigint._stradd(this.a_num, other.a_num);
+         } else {
+           const tout = LBigint._strsub(this.a_num, other.a_num);
+           if(tout[1]) this.a_neg = (! this.a_neg);
+           this.a_num = tout[0];
+         }
+         return this;
+       }
+     
+       iszero()
+       {
+         return(this.a_num === 0n);
+       }
+     
+       
+       // Unusul - returns array, does not change current
+ 
+       dividei(div)
+       {
+         if(div < 0) {
+           div = 0 - div;
+           this.a_neg = !this.a_neg;
+         }
+         this.a_num = LBigint._strdividei(this.a_num, div);
+       }
+ 
+       divmod(div)
+       {
+         const ans = LBigint._strdivmod(this.a_num, div.a_num);
+         const neg = (this.a_neg != div.a_neg)
+     
+         const oans = new LBigint(ans[0]);
+         oans.a_neg = (this.a_neg != div.a_neg);
+     
+         let arr;
+     
+         if(this.a_neg)
+           arr = LBigint._strsub(div.a_num, ans[1])[0];
+         else
+           arr = ans[1];
+         const omod = new LBigint(arr);
+     
+         omod.a_neg = div.a_neg;
+     
+         return[oans, omod]
+       }
+       powmod(exp, mod)
+       {
+         if(exp.a_neg) {
+           console.trace();
+           throw("Cannot have negative numbers in powmod");
+         }
+         LBigint._strpowmod(this.a_num, exp, mod.a_num);
+         if(this.a_neg && (!LBigint._strgetbit(exp.a_num, 0))) {
+           this.a_neg = false;
+         }
+         if(this.a_neg) {
+           this.a_neg = false;
+           this.a_num = LBigint._strsub(mod.a_num, this.a_num)[0];
+     
+         }
+     
+         return this;
+       }
+       powmodi(exp, mod)
+       {
+         if(exp < 0) {
+           console.trace();
+           throw("Cannot have negative numbers in powmod");
+         }
+         this.a_num = LBigint._strpowmodi(this.a_num, exp, mod.a_num);
+         if(this.a_neg && ((exp & 0x01) == 0)) {
+           this.a_neg = false;
+         }
+         if(this.a_neg) {
+           this.a_neg = false;
+           this.a_num = LBigint._strsub(mod.a_num, this.a_num)[0];
+         }
+         return this;
+       }
+     
+       sign()
+       {
+         if(this.a_num === 0n)
+           return 0;
+         else if(this.a_neg)
+           return -1;
+         else
+           return 1;
+       }
+     
+       multiply(a)
+       {
+         this.a_num = LBigint._strmultiply(this.a_num, a.a_num);
+         this.a_neg = (this.a_neg != a.a_neg);
+         return this;
+       }
+     
+       mod(m)
+       {
+         this.a_num = LBigint._strmod(this.a_num, m.a_num);
+         if(this.a_num == 0 && this.a_neg) this.a_neg = false; 
+         if(this.a_neg) {
+           this.a_num = LBigint._strsub(m.a_num, this.a_num)[0];
+           this.a_neg = false;
+         }
+         return this;
+       }
+ 
+       static _strfromarray(arr)
+       {
+         let num = 0n;
+         for(let a of arr) {
+           num = (num << 8n) | BigInt(a);
+         }
+         return num;
+       }
+ 
+       static _strdivide(a, b)
+       {
+         return LBigint._strdivmod(a, b)[0];
+       }
+     
+       static _strmod(a, b)
+       {
+         return LBigint._strdivmod(a, b)[1];
+       }
+     
+       static _strdivmod(a, b)
+       {
+     
+         return[a / b, a % b];
+       }
+     
+       /*
+       The Get bit and byte are little endian
+       */
+     
+       getbit(num)
+       {
+         return LBigint._strgetbit(this.a_num, num)
+       }
+     
+       rightbitshift()
+       {
+         this.a_num >>= 1n;
+         return this;
+       }
+     
+       
+       getbyte(num)
+       {
+         return LBigint._strgetbyte(this.a_num, num)
+       }
+     
+       bitlen()
+       {
+         return LBigint._strgetbitlen(this.a_num);
+       }
+     
+       sqrt(mod)
+       {
+         this.a_num = LBigint._strsqrt(this.a_num, mod.a_num);
+         return this;
+       }
+       
+       bytelen()
+       {
+         return LBigint._strbytelen(this.a_num);
+       }
+     
+       cmp(b)
+       {
+         if(this.a_neg != b.a_neg) {
+           if(this.a_neg) {
+             return -1;
+           } else {
+             return 1;
+           }
+         } else {
+           let ret = LBigint._strcmp(this.a_num, b.a_num);
+           if (this.a_neg) ret = 0 - ret;
+           return ret;
+         }
+       }
+     
+       cmpz()
+       {
+         if(this.a_num === 0n)
+           return 0;
+         else if (this.a_neg) {
+           return -1;
+         } else {
+           return 1;
+         }
+       }
+     
+     
+       /* Multiplyi - other should be less than base */
+       multiplyi(other)
+       {
+         if(this.iszero()) return this;
+         if(other == 0) {
+           this.a_neg = false;
+           this.a_num = new Array();
+         } else {
+           if(other < 0) {
+             this.a_neg = (! this.a_neg);
+             other = 0 - other;
+           }
+           this.a_num = LBigint._strmulti(this.a_num, other);
+         }
+         return this;
+       }
+     
+       inverse(m)
+       {
+     
+         // if a < 0 or m <= a: a = a % m
+     
+         let c = new LBigint(this);
+         let d = new LBigint(m);
+     
+         if(c.a_neg || m.cmp(c) < 0) {
+           c.mod(m);
+         }
+     
+         let uc = new LBigint(1);
+         let vc = new LBigint(0);
+         let ud = new LBigint(0);
+         let vd = new LBigint(1);
+     
+         // let iter = 0;
+     
+         while(!c.iszero()) {
+           const qc = d.divmod(c);
+           const q = qc[0].copy();
+           d = c.copy();
+           c = qc[1].copy();
+     
+           const ucc = uc.copy();
+           const vcc = vc.copy();
+           const udc = ud.copy();
+           const vdc = vd.copy();
+     
+           uc = udc.copy().subtract(q.copy().multiply(ucc));
+           vc = vdc.copy().subtract(q.copy().multiply(vcc));
+           ud = ucc.copy();
+           vd = vcc.copy();
+           // iter++; if(iter > 1) throw("Stop here");
+         }
+     
+         if(LBigint._strcmp(d.a_num, NUM_ONE) != 0) {
+           console.log(d.a_num);
+           console.trace();
+           throw("Expecting d to be 1 in inverse")
+         }
+     
+         if(ud.a_neg)
+           ud.add(m);
+     
+         this.a_num = ud.a_num;
+         this.a_neg = ud.a_neg;
+         return this;
+       }
+     
+       toString()
+       {
+         let ans = LBigint._strtohex(this.a_num);
+         if(ans == "") return "0";
+         if(this.a_neg) ans = "-" + ans;
+         return ans;
+       }
+     
+       toArray()
+       {
+         return LBigint._strtoarray(this.a_num);
+       }
+     
+       static _strdividei(a, i)   // i needs to be below BASE
+       {
+         return a / BigInt(i);
+       }
+     
+       static _strpowmod(num, exp, mod)
+       {
+     
+         let ans = 1n;
+     
+         while(exp !== 0n)
+         {
+           if((exp & NUM_ONE) === 1n) {
+             ans = (ans * num) % mod;
+           }
+           num = (num * num) % mod;
+           exp >>= NUM_ONE;
+         }
+         return ans;
+       }
+     
+       static _strpowmodi(num, expi, mod)
+       {
+         return LBigint._strpowmod(num, BigInt(expi), mod);
+       }
+     
+     
+       static _strgetbitlen(num)
+       {
+         let see = NUM_ONE;
+         let len = 0;
+     
+         while(num !== 0n) {
+           len++;
+           num >>= 1n;
+         }
+         return len;
+       }
+     
+       static _strbytelen(a)
+       {
+         return Math.ceil(LBigint._strgetbitlen(a) / 8);
+       }
+     
+       static _strgetbit(a, num)
+       {
+         return (a & (NUM_ONE << BigInt(num))) !== 0n;
+       }
+     
+       static _strgetbyte(a, num)
+       {
+         let sbits = BigInt(8 * num);
+         return Number((a & (BigInt(0xff) << sbits )) >> sbits);
+       }
+     
+       static _strsqrt(a, mod)
+       {
+         /*
+         """ This was shamelesslty knicked from Ely Bendersky
+           from http://eli.thegreenplace.net/2009/03/07/computing-modular-square-roots-in-python/
+           then converted to Javascript 
+       
+           Find a quadratic residue (mod p) of 'a'. p
+           must be an odd prime.
+       
+           Solve the congruence of the form:
+             x^2 = a (mod p)
+           And returns x. Note that p - x is also a root.
+       
+           0 is returned is no square root exists for
+           these a and p.
+       
+           The Tonelli-Shanks algorithm is used (except
+           for some simple cases in which the solution
+           is known from an identity). This algorithm
+           runs in polynomial time (unless the
+           generalized Riemann hypothesis is false).
+         """
+     
+         */
+         
+         let modn = LBigint._strsubi(mod, 1)[0];
+         function legendre_symbol(ia) {
+           let ls = LBigint._strpowmod(ia, LBigint._strdividei(modn, 2), mod)
+     
+           if(LBigint._strcmp(ls, modn) == 0) {
+             return NUM_INVALID;
+           } else {
+             return ls;
+           }
+         }
+     
+         //  Simple cases
+     
+         if (LBigint._strcmp(legendre_symbol(a), NUM_ONE) != 0) {
+           return 0n;
+         } else if (a.length == 0) {
+           return 0n;
+         } else if (LBigint._strcmp(mod, NUM_TWO) == 0) {
+           return a;
+         } else if ((a[a.length -1] & 0x03) == 0x03) {
+           return _strpowmod(a, LBigint._strdividei(modn, 4), mod)
+         }
+     
+         // Partition p-1 to s * 2^e for an odd s (i.e.
+         // reduce all the powers of 2 from p-1)
+     
+         let e = 0;
+         let mods = mod;
+         let s = modn;
+         while(!(LBigint._strgetbit(modn, e)))
+         {
+           e+= 1;
+           s = LBigint._strdividei(s, 2);
+         }
+       
+         // Find some 'n' with a legendre symbol n|p = -1.
+         // Shouldn':t take long.
+          //
+         let n = NUM_TWO;
+         while (LBigint._strcmp(legendre_symbol(n), NUM_INVALID) != 0)
+         {
+           n = LBigint._straddi(n, 1);
+         }
+       
+         /*
+         # Here be dragons!
+         # Read the paper "Square roots from 1; 24, 51,
+         # 10 to Dan Shanks" by Ezra Brown for more
+         # information
+         #
+       
+         # x is a guess of the square root that gets better
+         # with each iteration.
+         # b is the "fudge factor" - by how much we're off
+         # with the guess. The invariant x^2 = ab (mod p)
+         # is maintained throughout the loop.
+         # g is used for successive powers of n to update
+         # both a and b
+         # r is the exponent - decreases with each update
+         #
+     
+         */
+     
+     
+         let x = LBigint._strpowmod(a, LBigint._strdividei(LBigint._straddi(s, 1), 2), mod)
+         let b = LBigint._strpowmod(a, s, mod)
+         let g = LBigint._strpowmod(n, s, mod)
+         let r = e
+     
+       
+         for(;;) {
+           let t = b
+     
+           for(var m = 0; m < r; m++) {
+             if (LBigint._strcmp(t, NUM_ONE) == 0)
+               break;
+             t = LBigint._strmod(LBigint._strmultiply(t, t), mod)
+           }
+       
+           if (m == 0)
+             return x;
+     
+           let gs = LBigint._strpowmod(g, (new LBigint(2 ** (r - m - 1))).a_num, mod);
+           g = LBigint._strmod(LBigint._strmultiply(gs,gs), mod);
+           x = LBigint._strmod(LBigint._strmultiply(x, gs),mod);
+           b = LBigint._strmod(LBigint._strmultiply(b,g),mod);
+           r = m
+         }
+       }
+     
+       static _strmulti(a, inp)
+       {
+         return LBigint._strmultiply(a, BigInt(inp));
+       }
+     
+     
+       static _strmultiply(a, b)
+       {
+         return a * b;
+       }
+     
+     
+       static _stradd(a, b)
+       {
+         return a + b;
+       }
+     
+       static _straddi(a, i)
+       {
+         return LBigint._stradd(a, BigInt(i));
+       }
+     
+       static _strsub(a, b)
+       {
+         if(a > b) {
+           return [a - b, false];
+         } else {
+           return [b - a, true];
+         }
+       }
+     
+       static _strsubi(a, bi)
+       {
+         return LBigint._strsub(a, BigInt(bi));
+       }
+     
+       static _strcmp(a, b)
+       {
+         if(a > b)
+           return 1;
+         else if (a < b)
+           return -1;
+         else
+           return 0;
+       }
+     
+     
+       static _strfromhex(hex)
+       {
+         // hex MUST be a string, assume 
+         return BigInt("0x" + hex);
+       }
+           
+       static _strtoarray(num)
+       {
+         let out = new Array();
+         while(num != 0n) {
+           out.unshift(Number(num & BigInt(0x00ff)));
+           num >>= 8n;
+         }
+         return out;
+       }
+     
+       static _strtohex(ints)
+       {
+         return ints.toString(16);
+       }
+       static _strfromnumber(ints)
+       {
+         return BigInt(ints);
+       }
+     }
+     return LBigint
+   }();
+ 
+   function toUCS4(func, arr)
+   {
+     // From Array to UCS4
+     let c = 0;
+   
+     let size = 0;
+   
+     for(let a of arr)
+     {
+       if(size != 0) {
+         size -= 6;
+         if((a & 0xc0) != 0x80) {    // Invalid - abort current
+           size = 0;     // Force start char next
+         } else {
+           c |= a << size;
+         }
+         if(size == 0) func(c);
+         continue;
+       }
+ 
+       if(size == 0) {
+         if((a & 0xfe) == 0xfc) {      // 31 Bits
+           size = 30;
+           c = (a & 0x01) << 30;
+         } else if((a & 0xfc) == 0xf8) {   // 26 Bits
+           size = 24;
+           c = (a & 0x03) << 24;
+         } else if((a & 0xf8) == 0xf0) {   // 21 Bits
+           size = 18;
+           c = (a & 0x07) << 18;
+         } else if((a & 0xf0) == 0xe0) {   // 16 Bits
+           size = 12;
+           c = (a & 0x0f) << 12;
+         } else if((a & 0xe0) == 0xc0) {   // 11 Bits
+           size = 6;
+           c = (a & 0x1f) << 6;
+         } else if((a & 0x80) == 0)  {   // 0 Bits, negativ here, add to string later
+           func(a);
+         }
+       }
+     }
+   }
+   
+   function toUTF16(func, arr)
+   {
+     // From Array to UTF16 string 
+     function _ifunc(b)
+     {
+       if((b & 0xffff0000) != 0) {
+         if((b & 0xfff00000) != 0) {
+           func(String.fromCharCode(0xd800) | (b & (0x0ffc00 >>> 10)));
+           func(String.fromCharCode(0xdc00) | (b & (0x03ff)));
+         } else {
+           console.trace();
+           console.log("To UTF16 error");
+         }
+       } else {
+         if(b != 0) func(String.fromCharCode(b));
+       }
+     }
+     toUCS4(_ifunc, arr);
+   }
+   
+   function fromUTF16(func, str)
+   {
+     /*
+     UTF Conversion - Converts str (aassumed UTF16) to UTF8 byte array
+     Not doing BOM here
+     */
+     let len = str.length;
+     let trans = 0;
+     for(let i = 0; i < len; i++) {
+       let c = str.charCodeAt(i);
+       if((c & 0xfc00) == 0xd800) {
+         if(trans != 0) throw("Decode utf16, unexpected 0xd800");
+         trans = (((c + 1) & 0x03ff)  << 10) & 0x80;
+         continue
+       } else if ((c & 0xfc00) == 0xdc00) {
+         if(trans == 0) throw("Decode utf16, unexpected 0xdc00");
+         c = trans | (c & 0x03ff);
+         trans = 0;
+       }
+   
+       if(trans != 0) throw("Decode utf16, Expected 0xdc00");
+   
+       if(c < 128) {               // 7 Bits
+   
+         func(c);                // 0AAAAAAA
+   
+       } else if(c  < 0x0800) {        // 11 Bits - 0000!AAA BBBBBBBB    
+   
+         func(0xc0 | ((c & 0x07c0) >>> 6));    // 110AAABB
+         func((c & 0x003f) | 0x80)         // 10BBBBBB
+   
+       } else if (c < 0x010000) {        // 16 bits - 0000000! AAAAAAAA AAAAAAAA
+   
+         func(0xe0 | ((c & 0xf000) >>> 12));   // 1110AAAA
+         func(0xc0 | ((c & 0x0fc0) >>> 6));    // 10AAAABB
+         func(0xc0 | (c & 0x3f));        // 10BBBBBB
+   
+       } else if (c < 0x200000) {        // 21 bits - 00!AAAAA YBBBBBBBB CCCCCCCC
+         
+         func(0xf0 | ((c & 0x1c0000) >>> 18));   // 11110AAA
+         func(0xc0 | ((c & 0x03f000) >>> 12));   // 10AABBBB
+         func(0xc0 | ((x & 0x000fc0) >>> 6));  // 10BBBBCC
+         func(0xc0 | (c & 0x3f));        // 10CCCCCC
+   
+       } else if (c < 0x04000000) {      // 26 bits 00000!AA BBBBBBBB CCCCCCCC DDDDDDDD
+   
+         func(0xf0 | ((c & 0x03000000) >>> 24));   // 111110AA
+         func(0xc0 | ((c & 0x00fc0000) >>> 18));   // 10BBBBBB
+         func(0xc0 | ((c & 0x0003f000) >>> 12));   // 10BBCCCC
+         func(0xc0 | ((c & 0x00000fc0) >>> 6));  // 10CCCCDD
+         func(0xc0 | (c & 0x3f));          // 10DDDDDD
+   
+       } else if (c < 0x80000000) {      // 31 bits !AAAAAAA BBBBBBBB CCCCCCCC DDDDDDDD
+   
+         func(0xf0 | ((c & 0x40000000) >>> 30));   // 1111110A
+         func(0xc0 | ((c & 0x03f00000) >>> 24));   // 10AAAAAA
+         func(0xc0 | ((c & 0x00fc0000) >>> 18));   // 10BBBBBB
+         func(0xc0 | ((c & 0x0003f000) >>> 12));   // 10BBCCCC
+         func(0xc0 | ((c & 0x00000fc0) >>> 6));  // 10CCCCDD
+         func(0xc0 | (c & 0x3f));          // 10DDDDDD
+       } else {
+         console.trace();
+         console.log("From UTF16 Error");
+       }
+     }
+   }
+   
+   
+   const ToBase64 = function () 
+   {
+   
+     const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+     class _ToBase64 {
+       constructor()
+       {
+         this.initialize();
+       }
+     
+       initialize()
+       {
+         this.carry = 0;
+         this.part = 0;
+         this.out = "";
+         this.count = 0;
+       }
+     
+       static process(bytes)
+       {
+         const sha = new _ToBase64;
+         sha.input(bytes);
+         return sha.output();
+       }
+     
+       input(bytes)
+       {
+         for(let b of bytes)
+         {
+           switch(this.part) {
+           case 0:
+             // Put an occasional space in it
+             if(this.count >= 4) {
+               this.out += " ";
+               this.count = 0;
+             }
+             this.out += BASE64.charAt((b & 0xfc) >>> 2);
+             this.carry = (b & 0x03) << 4;
+             this.part = 1;
+             break;
+           case 1:
+             this.out += BASE64.charAt(this.carry | ((b & 0xf0) >>> 4));
+             this.carry = (b & 0x0f) << 2;
+             this.part = 2;
+             break;
+           case 2:
+             this.out += BASE64.charAt(this.carry | ((b & 0xc0) >>> 6));
+             this.out += BASE64.charAt(b & 0x3f);
+             this.part = 0;
+             this.carry = 0;
+             this.count += 1;
+             break;
+           }
+         }
+       }
+       output()
+       {
+         if(this.part != 0) {
+           this.out += BASE64.charAt(this.carry);
+           if(this.part == 1) this.out += "===";
+           else if(this.part == 2) this.out += "==";
+         }
+         const out = this.out;
+         this.initialize();
+         return out;
+       }
+     
+     }
+     return _ToBase64;
+   }();
+   
+   
+   const FromBase64 = function ()
+   {
+     class _FromBase64 {
+       constructor() {
+         this.initialize();
+       }
+       initialize()
+       {
+         this.carry = 0;
+         this.part = 0;
+         this.out = new Array();
+       }
+     
+       input(str)
+       {
+         const slen = str.length;
+         for(let i = 0; i < slen; i++) {
+           const s = str.charCodeAt(i);
+           if(s <= 32) continue;   // Spaces
+           let wc = 0;
+           if(s >= 0x41 && s <= 0x5A) {    // A - Z
+             wc = s - 0x41;
+           } else if(s >= 0x61 && s <= 0x7A) {   //a - z
+             wc = s - 0x47           // 0x27 = 'A' + 26
+           } else if(s >= 0x30 && s <= 0x39) {   // 0 - 9
+             wc = s + 0x04;          // 0x04 = '0' - 52
+           } else if(s == 0x2b) {        // +
+             wc = 62;
+           } else if(s == 0x2f) {        // /
+             wc = 63;
+           } else if(s == 0x3d)  {   // = Sign, Terminate all
+             if(this.carry == 0) this.part = 0;
+             continue;
+           } else {
+             continue;
+           }
+     
+           switch(this.part) {
+           case 0:
+             this.carry = wc << 2;
+             this.part = 1;
+             break;
+           case 1:
+             this.out.push(this.carry | (wc & 0x30) >>> 4);
+             this.carry = (wc & 0x0f) << 4;
+             this.part = 2;
+             break;
+           case 2:
+             this.out.push(this.carry | (wc & 0x3c) >>> 2);
+             this.carry = (wc & 0x03) << 6;
+             this.part = 3;
+             break;
+           case 3:
+             this.out.push(this.carry | wc);
+             this.carry = 0;
+             this.part = 0;
+             break;
+           }
+         }
+     
+       }
+     
+       output()
+       {
+         if(this.part != 0)
+           this.out.push(this.carry);
+     
+         const out = this.out;
+         this.initialize();
+         return out;
+       
+       }
+     
+       static process(str)
+       {
+         const fb = new _FromBase64();
+         fb.input(str);
+         return fb.output();
+       }
+     }
+     return _FromBase64;
+   }();
+   
+   
+   /*
+   Browsers use UTF16 - to get around
+   "number of character" limit in instant messages
+   include a Unicode BMP method of encoding.
+   This can be 15 Bits, basically (15 bits) + 0x0100, making  0x0100 to 0x80ff)
+                       (00000001.00000000 - 10000000.ffffffff)
+   To pad this out, 1 or 2 single 8 bit cshjaracter(s)  0x9100
+   are added to the string.
+   
+   Keeping all < 0x100 for whatever
+   
+   */
+       
+   const ToBaseBMP = function () 
+   {
+   
+     class _ToBaseBMP {
+       constructor()
+       {
+         this.initialize();
+       }
+     
+       initialize()
+       {
+         this.carry = 0;
+         this.part = 0;
+         this.lshift = 0;
+         this.out = "";
+         this.count = 0;
+       }
+     
+       static process(bytes)
+       {
+         const sha = new _ToBaseBMP;
+         sha.input(bytes);
+         return sha.output();
+       }
+     
+       input(bytes)
+       {
+         for(let b of bytes)
+         {
+     
+           switch(this.part) {
+           case 0:   // -> Carry(8)
+             this.carry = b << 6;
+             this.part = 1;
+             break;
+           case 1:   // Out(Carry(8) + 6) -> Carry 2
+             this.out += String.fromCharCode(0x0100 + (this.carry | (b >>> 2)));
+             this.carry = (b & 0x03) << 12;
+             this.part = 2;
+             break;
+           case 2:   // Carry 2 + 8  -> Carry 10
+             this.carry |= b << 4;
+             this.part = 3;
+             break;
+           case 3:   // Out(Carry 10 + 4) -> Carry 4
+             this.out += String.fromCharCode(0x0100 + (this.carry | (b >>> 4)));
+             this.carry  = (b & 0x0f) << 10;
+             this.part = 4;
+             break;
+           case 4:   // Carry 4 + 8 -> Carry 12
+             this.carry |= b << 2;
+             this.part = 5;
+             break;
+           case 5:   // Out(Carry 12 + 2) -> Carry 6
+             this.out += String.fromCharCode(0x0100 + (this.carry | (b  >>> 6)));
+             this.carry  = (b & 0x3f) << 8;
+             this.part = 6;
+             break;
+           case 6:
+             this.out += String.fromCharCode(0x0100 + (this.carry | b));
+             this.carry = 0;
+             this.part = 0;
+             break;
+           }
+         }
+       }
+       output()
+       {
+         // I have to pad out with zeroes in middle.  Right pain, but nothing I can really do about it
+         switch(this.part) {
+         case 3:
+         case 5:
+           this.out += String.fromCharCode(0x9100 + ((this.carry & 0x3fc0) >>> 6));
+           this.out += String.fromCharCode(0x9100 + ((this.carry & 0x3f) << 2));
+           break;
+         case 1:
+         case 2:
+         case 4:
+         case 6:
+           this.out += String.fromCharCode(0x9100 + ((this.carry & 0x3fc0) >>> 6));
+           break;
+         case 0:
+           break;
+         default:
+           console.trace();
+           console.log("Invalid EOL in BBM");
+           break;
+         }
+         const out = this.out;
+         this.initialize();
+     
+         return out;
+       }
+         
+     }
+     return _ToBaseBMP;
+   }();
+   
+   
+   const FromBaseBMP = function ()
+   {
+     class _FromBaseBMP {
+       constructor() {
+         this.initialize();
+       }
+       initialize()
+       {
+         this.carry = 0;
+         this.part = 0;
+         this.opart = 0;
+         this.out = new Array();
+       }
+     
+       input(str)
+       {
+         const slen = str.length;
+         for(let i = 0; i < slen; i++) {
+           let s = str.charCodeAt(i);
+           if(s < 0x0100) continue;   // Not interested in these
+     
+           s -= 0x100;
+           // Need to test if last one
+           if((s & 0xf000) == 0x9000) {
+             s &= 0xff;
+             switch(this.part) {
+             case 1: this.out.push(this.carry | (s >>> 6)); this.carry = (s & 0x3f) << 2; break;
+             case 2: this.out.push(this.carry | (s >>> 4)); this.carry = (s & 0x0f) << 4; break;
+             case 3: this.out.push(this.carry | (s >>> 2)); this.carry = (s & 0x03) << 6; break;
+             }
+             // if(this.part < 8) {
+               // this.opart = this.part;
+               // this.part = 8;
+             // }
+           } else {
+             switch(this.part) {
+             case 0:     // Out(8)  -> Carry(6)
+               this.out.push(s >>> 6);
+               this.carry = (s & 0x003f) << 2;
+               this.part = 1;
+               break;
+             case 1:    //  Out(carry(6) + 2) + Out(8) -> Carry 4
+               this.out.push(this.carry | (s >>> 12));
+               this.out.push((s & 0x0ff0) >> 4);
+               this.carry = (s & 0x000f) << 4;
+               this.part = 2;
+               break;
+             case 2:   // Out(carry(4) + 4) + Out(8) -> Carry 2
+               this.out.push(this.carry | (s >>> 10));
+               this.out.push((s & 0x03fc) >> 2);
+               this.carry = (s & 0x0003) << 6;
+               this.part = 3;
+               break;
+             case 3:   // out(Carry(2) + 6) + out(8) -> Carry 0 RESTART
+               this.out.push(this.carry | (s >>> 8));
+               this.out.push(s & 0x00ff);
+               this.part = 0;
+               break;
+             default:
+               this.part = this.opart;
+               console.trace();
+               console.log("Invalid BaseBMP");
+               break;
+             }
+           }
+         }
+       }
+             
+       output()
+       {
+         const out = this.out;
+         this.initialize();
+         return out;
+       
+       }
+     
+       static process(str)
+       {
+         const fb = new _FromBaseBMP();
+         fb.input(str);
+         return fb.output();
+       }
+     }
+     return _FromBaseBMP;
+   }();
+   
+   
+   function getFromBasePK(str)
+   {
+     // The first 8 bits is 00000001
+     let s = str.charCodeAt(0);
+ 
+     if(s >= 0x100) {
+       return FromBaseBMP;
+     } else  {
+       return FromBase64;
+     }
+     return null;
+   }
+   
+   /*
+    * The SHA256 algorythm
+    */
+   const SHA256 = function() {
+   
+   const _SHA256_K = [
+      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+   ];
+   
+   class SHA256 {
+     constructor() {
+       this.words = new Array(16);
+       this.buf = new Array();
+       this.out = new Array(64);
+       this.initialize();
+     }
+   
+     initialize()
+     {
+       this.h = new Array(0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19);
+       this.buf.length = 0;
+       this.len = 0;
+     }
+   
+     write_field(msg)  // Writes a form field or text area
+     {
+       let self = this;
+       let oldwhite = false;
+       function _apbyte(_byte)
+       {
+         // Following trims white spaces and compresses white spaces
+         if(_byte <= 32) {
+           if(!oldwhite) oldwhite = true;
+           return;
+         } else {
+           if(oldwhite) {
+             self.putbyte(32);
+             oldwhite = false;
+           }
+         }
+   
+         self.putbyte(_byte);
+       }
+     
+       fromUTF16(_apbyte, msg);
+   
+       this.procbuf();
+   
+     }
+   
+     // Assume UTF8 for write_string
+     write_string(str)
+     {
+       let slen = str.length;
+       let oldwhite = false;
+   
+       for(let i = 0; i < slen; i++) {
+         let b = str.charCodeAt(i) & 0xff;
+         if(b <= 32) {
+           if(!oldwhite) oldwhite = true;
+         } else {
+           if(oldwhite) {
+             self.putbyte(32);
+             oldwhite = false;
+           }
+           self.putbyte(b);
+         }
+       }
+       this.procbuf();
+     }
+   
+     putbytes(bytes)
+     {
+       this.buf = this.buf.concat(bytes);
+       this.len += bytes.length;
+     }
+     putbyte(abyte)
+     {
+       this.buf.push(abyte);
+       this.len += 1;
+     }
+   
+     procbuf()
+     {
+       for(var i = 64; i <= this.buf.length; i += 64)
+         this._hashmix(this.buf.slice(i - 64, i));
+   
+       this.buf = this.buf.slice(i - 64);
+     }
+   
+     finalize(here)
+     {
+       // Add a 1
+       this.buf.push(0x80);
+   
+   
+       // Room for the length in bits integer
+   
+       let blen = this.buf.length;
+       if (blen > 56) {
+         for(var i = blen; i < 64; i++) this.buf.push(0);
+         this._hashmix();
+         this.buf.length = 0;
+         blen = 0;
+       }
+   
+       // Pad out to integer End of block less bit length integer
+   
+       for(var i = blen; i < 59; i++) this.buf.push(0);
+   
+       // The length in bits
+   
+       this.buf[59] = (this.len >>> 29) & 0xff;
+       this.buf[60] = (this.len >>> 21) & 0xff;
+       this.buf[61] = (this.len >>> 13) & 0xff;
+       this.buf[62] = (this.len >>> 5) & 0xff;
+       this.buf[63] = (this.len << 3) & 0xff;
+   
+       this._hashmix();
+   
+       return this;
+     }
+   
+     toString()
+     {
+       // Return 32 bit hash
+   
+       let res = "";
+       for(let i = 0; i < 8; i++) {
+         res += (this.h[i] >>> 24).toString(16);
+         res += ((this.h[i] >>> 16) & 0xff).toString(16);
+         res += ((this.h[i] >>> 8) & 0xff).toString(16);
+         res += (this.h[i] & 0xff).toString(16);
+       }
+       this.initialize();
+       return res;
+     }
+   
+     toWordArray()
+     {
+       return this.h;
+     }
+   
+     toByteArray()
+     {
+       const res = new Array(32);
+       let j = 0;
+       for(var i = 0; i < 8; i++)
+       {
+         const w = this.h[i];
+         res[j++] = w >>> 24;
+         res[j++] = (w >>> 16) & 0xff;
+         res[j++] = (w >>> 8) & 0xff;
+         res[j++] = w & 0xff;
+       }
+       return res;
+     }
+   
+     _hashmix() {
+       let j = 0;
+       const W = this.words;
+       for(let i = 0; i < 16; i++)
+           W[i] = this.buf[j++] << 24 |
+                this.buf[j++] << 16 |
+                this.buf[j++] << 8 |
+                this.buf[j++];
+   
+       for(let i = 16; i < 64; i++)
+   
+         W[i] = (_sigma1(W[i - 2]) +  W[i - 7] + _sigma0(W[i - 15]) + W[i - 16]) & 0x00ffffffff;
+   
+         const state = new Array().concat(this.h);
+   
+         for(let i = 0; i < 64; i++) {
+           const T1 = state[7] + _Sigma1(state[4]) +
+           _Ch(state[4], state[5], state[6]) + _SHA256_K[i] + W[i];
+           const T2 = _Sigma0(state[0]) + _Maj(state[0], state[1], state[2]);
+           state.pop();
+           state.unshift((T1 + T2) & 0x00ffffffff);
+           state[4] = (state[4] + T1) & 0x00ffffffff;
+         }
+   
+       for(let i = 0; i < 8; i++)
+         this.h[i] = (this.h[i] + state[i]) & 0x00ffffffff;
+   
+       this.buf.length = 0;
+     }
+   
+     static hash_field(msg)
+     {
+       const sha = new SHA256();
+       sha.write_field(msg);
+       return sha.finalize();
+     }
+   
+   }
+   
+   function _sigma0(x)  { return ((x >>> 7)  | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3); }
+   function _sigma1(x)  { return ((x >>> 17) | (x << 15)) ^ ((x >>> 19) | (x << 13)) ^ (x >>> 10); } 
+   function _Sigma0(x)  { return ((x >>> 2)  | (x << 30)) ^ ((x >>> 13) | (x << 19)) ^ ((x >>> 22) | (x << 10)); }
+   function _Sigma1(x)  { return ((x >>> 6)  | (x << 26)) ^ ((x >>> 11) | (x << 21)) ^ ((x >>> 25) | (x << 7)); }
+   function _Ch(x, y, z)  { return z ^ (x & (y ^ z)); }
+   function _Maj(x, y, z) { return (x & y) ^ (z & (x ^ y)); }
+   
+   return SHA256;
+   }();
+   
+   
+   /*
+   An attempt at using mouse moves, key codes, key presses etc
+   to create entropy
+   */
+   
+   const Entropy = function()
+   {
+   
+   const STORELENGTH = 37;       // Good idea if prime.  Should be above 32
+ 
+   class _Entropy {
+     constructor()
+     {
+       const store = new Array(STORELENGTH);
+       this.store = store;
+   
+       for(let i = 0; i < STORELENGTH; i++) store[i] = i;
+   
+       let idx = 0;
+   
+       function _addb(b)
+       {
+         store[idx] = (((store[idx] << 1) | (store[idx] >>> 7)) & 0xff) ^ b;
+         idx++;
+         if(idx >= STORELENGTH) idx = 0;
+       }
+       function _addn()
+       {
+         _addb((n & 0xff000000) >>> 12);
+         _addb((n & 0x00ff0000) >>> 8);
+         _addb((n & 0x0000ff00) >>> 4);
+         _addb(n & 0x000000ff);
+       }
+       function _adds(n)
+       {
+         _addb((n & 0x0000ff00) >>> 4);
+         _addb(n & 0x000000ff);
+       }
+       function _addm(n)
+       {
+         _addb((n & 0x00ff0000) >>> 8);
+         _addb((n & 0x0000ff00) >>> 4);
+         _addb(n & 0x000000ff);
+       }
+   
+       for(let i = 0; i < STORELENGTH; i++)
+         _addb(Math.random() & 0x100);
+       _addm(Date.now());
+   
+       this.ohash = this.gethash();
+       this.oidx = 0;
+   
+   
+       function _td(e)
+       {
+         _addm(Date.now());
+         let tc = e.targetTouches[0];
+         if(tc) {
+           _addm(Math.floor(tc.pageX * 1000));
+           _addm(Math.floor(tc.pageY * 1000));
+         }
+       }
+       function _md(e)  { _addm(Date.now()); }
+       function _kd(e)  { _addm(Date.now()); _addb(e.keyCode & 0xff);}
+   
+       document.addEventListener("mousemove", function(e) { _adds(e.offsetX ^ (e.offsetY << 6)); });
+       document.addEventListener("mousedown", _md);
+       document.addEventListener("mouseup", _md);
+       document.addEventListener("keydown", _kd);
+       document.addEventListener("keyup", _kd);
+       document.addEventListener("touchstart", _td);
+       document.addEventListener("touchend", _td);
+   
+       this.fidx = 0;
+       this.count = 0;
+     }
+   
+     putbytes(arr)
+     {
+       const store = this.store;
+       let idx = this.widx;
+       function _addb(b)
+       {
+         store[idx] = (((store[idx] << 3) | (store[idx] >>> 4)) & 0xff) ^ b;
+         idx++;
+         if(idx >= STORELENGTH) idx = 0;
+       }
+       for(let a of arr) _addb(a & 0xff);
+     }
+   
+     getbyte()
+     {
+       if(this.oidx >= 32)
+         this.ohash = this.gethash();
+       return this.ohash[this.oidx++];
+     }
+   
+     gethash()
+     {
+       const sha = new SHA256();
+       sha.putbytes(this.store);
+       const out = sha.finalize().toByteArray();
+       this.putbytes(out);
+       this.putbytes([(this.count++) & 0xff]);
+       return out;
+     }
+     getblock()
+     {
+       const sha = new SHA256();
+       sha.putbytes(this.store);
+       const out = sha.finalize().toByteArray();
+       this.putbytes(out);
+       this.putbytes([(this.count++) & 0xff]);
+       let i = 0;
+       let j = 16;
+       for(let i = 0, j = 0; i < 16; i++, j++) out[i] ^= j[i];
+       out.length = 16;
+       return out;
+     }
+   }
+   return _Entropy;
+   }();
+   
+   const entropy = new Entropy();
+ 
+   const AES = function()
+   {
+   
+   
+   const _rcon = [0x01000000, 0x02000000, 0x04000000, 0x08000000, 0x10000000, 0x20000000, 0x40000000, 0x80000000, 0x1B000000, 0x36000000,
+     0x6C000000, 0xD8000000, 0xAB000000, 0x4D000000, 0x9A000000, 0x2F000000, 0x5E000000, 0xBC000000, 0x63000000, 0xC6000000,
+     0x97000000, 0x35000000, 0x6A000000, 0xD4000000, 0xB3000000, 0x7D000000, 0xFA000000, 0xEF000000, 0xC5000000]
+   
+   
+   const _fsbox = [
+   0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+   0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+   0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+   0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+   0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+   0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+   0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+   0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+   0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+   0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+   0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+   0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+   0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+   0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+   0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+   0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16];
+   
+   const _rsbox = [
+   0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+   0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+   0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+   0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+   0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+   0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+   0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+   0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+   0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+   0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+   0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+   0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+   0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+   0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+   0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+   0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d];
+   
+   function _blockcopy(a, b) { for(var i = 0; i < 16; i++) a[i] = b[i]; }
+   function _blockxor(a, b) { for(var i = 0; i < 16; i++) a[i] ^= b[i]; }
+   function _blockzero(a) { for(let i = 0; i < 16; i++) a[i] = 0; }
+   
+   function _rotword(word)
+   {
+     return ((word & 0x00ffffff) << 8) | ((word & 0xff000000) >>> 24)
+   }
+   
+   function _subword(word)
+   {
+     return (_fsbox[(word & 0xff000000) >>> 24] << 24) |
+          (_fsbox[(word & 0x00ff0000) >>> 16] << 16) |
+          (_fsbox[(word & 0x0000ff00) >>>  8] <<  8) |
+          (_fsbox[(word & 0x000000ff)]);
+   }
+   
+   function _gmul(a, b)
+   {
+     let p = 0;
+   
+     // Unwind the following
+     if (b & 0x01) p ^= a;
+     if (a & 0x80) { a <<= 1;a ^= 0x11b} else { a <<= 1;}
+     if (b & 0x02) p ^= a;
+     if (a & 0x80) { a <<= 1;a ^= 0x11b} else { a <<= 1;}
+     if (b & 0x04) p ^= a;
+     if (a & 0x80) { a <<= 1;a ^= 0x11b} else { a <<= 1;}
+     if (b & 0x08) p ^= a;
+     if (a & 0x80) { a <<= 1;a ^= 0x11b} else { a <<= 1;}
+     if (b & 0x10) p ^= a;
+     if (a & 0x80) { a <<= 1;a ^= 0x11b} else { a <<= 1;}
+     if (b & 0x20) p ^= a;
+     if (a & 0x80) { a <<= 1;a ^= 0x11b} else { a <<= 1;}
+     if (b & 0x40) p ^= a;
+     if (a & 0x80) { a <<= 1;a ^= 0x11b} else { a <<= 1;}
+     if (b & 0x80) p ^= a;
+     return p
+   }
+   
+ 
+   function dummy(x) { }
+ 
+   const OFB = 1;
+   const CFB = 2;
+   const CTR = 3;
+   const CBC = 4;
+   const PCBC = 5;
+   const CTRB = 6;
+   
+   class _AES {
+   
+     constructor(inkey) {        // Inkey as an array of bytes
+   
+       const wlen = inkey.length;
+   
+       // Key length (in bytes) to rounds
+       this.k_rounds = { 16: 10, 24: 12, 32: 15 }[wlen];
+   
+       if(!this.k_rounds) {
+         throw("AES: Key not 32/24/16 bytes long");
+       }
+   
+       this.k_words = wlen / 4;
+       this.k_roundl = this.k_rounds - 1;
+       this.k_roundm = this.k_rounds - 2;
+       this.k_roundw = this.k_rounds * 4;
+       this.k_roundb = this.k_rounds * 16;
+   
+       const wkey = new Array(this.k_roundw);
+       let k = 0;
+       for(let i = 0; i < this.k_words; i++) {
+         let word = inkey[k++];
+         for(let j = 1; j < 4; j++) {
+           word = (word << 8) | inkey[k++];
+         }
+         wkey[i] = word;
+       }
+       let pent = wkey[this.k_words - 1];
+   
+       let rcptr = 0;
+     
+       for(let i = this.k_words;i<this.k_roundw;i++) {
+         let ent = pent;
+         if((i % this.k_words) == 0) {
+           ent = _subword(_rotword(ent)) ^ _rcon[rcptr++];
+         } else  if (this.k_words > 6 && (i % this.k_words) == 4) {
+           ent = _subword(ent);
+         }
+     
+         ent ^= wkey[i - this.k_words];
+         pent = ent;
+         wkey[i] = ent;
+       }
+   
+       const okey = new Array(this.k_roundb);
+       let j = 0;
+       for(let i = 0; i < this.k_roundw;i++) {
+         let w = wkey[i];
+         okey[j++] = (w & 0xff000000) >>> 24;
+         okey[j++] = (w & 0x00ff0000) >>> 16;
+         okey[j++] = (w & 0x0000ff00) >>> 8;
+         okey[j++] = w & 0x000000ff;
+       }
+   
+       let ol = [];
+       for(let s of okey) ol.push(s.toString(16));
+       this._key = okey;
+     }
+     
+     /*
+      * Cipher - In place
+      */
+     cipher(state) 
+     {
+       if(state.length != 16) {
+         console.trace();
+         throw("AES, cipher input expected to be 16 bytes");
+       }
+   
+       const self = this;
+   
+       function subBytes()
+       {
+         for(var i = 0; i < 16; i++) {
+           state[i] = _fsbox[state[i]];
+         }
+       }
+       
+       function mixColumns()
+       {
+         /*
+         Multiplication by 2 is done bu a bit left shift
+         Multiplication by 3 is done by a bit left shift and an exclusive or
+         */
+         let a = new Array(4);
+         let b = new Array(4);
+         let t;
+         for(let col = 0; col < 16; col+=4) {
+           for(let r = 0; r < 4; r++) {
+             t = state[col + r];
+             a[r] = t;
+             b[r] = t & 0x80 ?  (t << 1 ) ^ 0x011b : t << 1;
+           }
+           let wcol = col;
+           state[wcol] = b[0] ^ a[3] ^ a[2] ^ b[1] ^ a[1]; /* 2 * a0 + a3 + a2 + 3 * a1 */
+           wcol += 1;
+           state[wcol] = b[1] ^ a[0] ^ a[3] ^ b[2] ^ a[2]; /* 2 * a1 + a0 + a3 + 3 * a2 */
+           wcol += 1;
+           state[wcol] = b[2] ^ a[1] ^ a[0] ^ b[3] ^ a[3]; /* 2 * a2 + a1 + a0 + 3 * a3 */
+           wcol += 1;
+           state[wcol] = b[3] ^ a[2] ^ a[1] ^ b[0] ^ a[0]; /* 2 * a3 + a2 + a1 + 3 * a0 */
+         }
+       }
+           
+       function shiftRows()
+       {
+         const tcol = new Array(4);
+         for(let c = 1;c < 4; c++) {
+           let widx = c;
+           for (let i = 0; i < 4;) {
+             tcol[i++] = state[widx];
+             widx += 4;
+           }
+           for(let i = 0; i < 4;) {
+             let didx = c + ((i - c) * 4);
+             if(didx < 0) didx += 16;
+             state[didx] = tcol[i++];
+           }
+         }
+       }
+       function addRoundKey(roundno)
+       {
+         roundno <<= 4; // roundno *= 16;
+         for(let i = 0; i< 16;) {
+           state[i++] ^= self._key[roundno++];
+         }
+       }
+   
+       addRoundKey(0);
+   
+       for(let r = 1; r < this.k_roundl; r++) {
+         subBytes()
+         shiftRows();
+         mixColumns();
+         addRoundKey(r);
+     
+       }
+       subBytes()
+       shiftRows();
+       addRoundKey(this.k_roundl);
+     }
+   
+     /*
+      * DeCipher - In place
+      */
+   
+     decipher(state) 
+     {
+       if(state.length != 16) {
+         throw("AES, decipher input expected to be 16 bytes");
+       }
+   
+       const self = this;
+   
+       function subBytes()
+       {
+         for(var i = 0; i < 16; i++) {
+           state[i] = _rsbox[state[i]];
+         }
+       }
+       
+       function mixColumns()
+       {
+         /*
+         Multiplication by 2 is done bu a bit left shift
+         Multiplication by 3 is done by a bit left shift and an exclusive or
+         */
+         let a = new Array(4);
+         let b = new Array(4);
+         let t;
+         for(let col = 0; col < 16; col+=4) {
+           for(let r = 0; r < 4; r++) {
+             a[r] = state[col + r];
+           }
+           let wcol = col;
+           state[wcol] = _gmul(14, a[0]) ^ _gmul(11, a[1]) ^ _gmul(13, a[2]) ^ _gmul( 9, a[3])
+           wcol++;
+           state[wcol] = _gmul( 9, a[0]) ^ _gmul(14, a[1]) ^ _gmul(11, a[2]) ^ _gmul(13, a[3])
+           wcol++;
+           state[wcol] = _gmul(13, a[0]) ^ _gmul( 9, a[1]) ^ _gmul(14, a[2]) ^ _gmul(11, a[3])
+           wcol++;
+           state[wcol] = _gmul(11, a[0]) ^ _gmul(13, a[1]) ^ _gmul( 9, a[2]) ^ _gmul(14, a[3])
+         }
+       }
+           
+       function shiftRows()
+       {
+         const tcol = new Array(4);
+         for(let c = 1;c < 4; c++) {
+           let widx = c;
+           for (let i = 0; i < 4;) {
+             tcol[i++] = state[widx];
+             widx += 4;
+           }
+           for(let i = 0; i < 4;) {
+             let didx = c + ((i + c) * 4);
+             if(didx > 16) didx -= 16;
+             state[didx] = tcol[i++];
+           }
+         }
+       }
+       function addRoundKey(roundno)
+       {
+         roundno <<= 4; // roundno *= 16;
+         for(let i = 0; i< 16;) {
+           state[i++] ^= self._key[roundno++];
+         }
+       }
+   
+       addRoundKey(this.k_roundl);
+       shiftRows();
+       subBytes()
+     
+       for(var r = this.k_roundm; r > 0; r--) {
+         addRoundKey(r);
+         mixColumns();
+         shiftRows();
+         subBytes()
+       }
+       addRoundKey(0);
+   
+     }
+   
+   }
+
+   // The BLOCK modes
+
+   // Apply count
+
+   function apply_count(wiv, iv, count)
+   {
+       _blockcopy(wiv, iv);
+       wiv[15] ^= (count & 0x000000ff);
+       wiv[14] ^= ((count & 0x0000ff00) >>> 8);
+       wiv[13] ^= ((count & 0x00ff0000) >>> 16);
+       wiv[12] ^= ((count & 0xff000000) >>> 24);
+   }
+   
+   class _BlockEncodeBase extends _AES {
+     constructor(key, outproc, iv) {
+       super(key);
+       this.outproc = outproc
+       this.iv = new Array(16);
+       this.out = new Array(16);
+       for(let i = 0; i < 16; i++) this.iv[i] = iv[i];
+       this.oidx = 0;
+   
+       // Encoding the IV happens on first "out"
+       // A callback function
+     }
+ 
+     _do_encode_block()
+     {
+       this.encode_block();
+       _blockzero(this.out);
+       this.oidx = 0;
+     }
+     encode_block()
+     {
+       throw("_BlockEncodeBase: Need to derive encode_block");
+     }
+   
+     put_byte(_byte)
+     {
+       this.out[this.oidx++] = _byte;
+       if(this.oidx >= 16) {
+         this._do_encode_block();
+       }
+     }
+   
+     put_bytes(bytes)
+     {
+       for(let b of bytes) this.put_byte(b);
+     }
+   }
+   
+   class _BlockDecodeBase extends _AES {
+   
+     constructor(key, outproc) {
+       super(key);
+       this.outproc = outproc
+       this.out = new Array(16);
+       this.iv = new Array(16);
+       this.oidx = 0;
+       this.hasreadiv = false;
+       this.ciphernum = 0;
+     }
+ 
+     decode_block()
+     {
+       throw("_BlockDecodeBase: Need to derive decode_block");
+     }
+   
+     put_byte(_byte)
+     {
+       this.out[this.oidx++] = _byte;
+       if(this.oidx >= 16) {
+         this._do_decode_block();
+       }
+     }
+   
+     put_bytes(bytes)    // Assume UTF8
+     {
+       for(let b of bytes) this.put_byte(b);
+     }
+   }
+   
+   class _BlockEncodeFB extends _BlockEncodeBase {
+     constructor(key, outproc, iv)
+     {
+       super(key, outproc, iv);
+       this.output(this.iv);
+     }
+     output(arr)
+     {
+       this.outproc(arr);
+     }
+   }
+   
+   class _BlockDecodeFB extends _BlockDecodeBase {
+     constructor(key, outproc, iv)
+     {
+       super(key, outproc, iv);
+     }
+     output(arr)
+     {
+       this.outproc(arr);
+     }
+     _do_decode_block()
+     {
+       if(this.hasreadiv) {
+         this.decode_block();
+       } else {
+         _blockcopy(this.iv, this.out);
+         this.hasreadiv = true;
+       }
+       _blockzero(this.out);
+       this.oidx = 0;
+     }
+   }
+   
+   class _BlockEncodeSteal extends _BlockEncodeBase {
+     constructor(key, outproc, iv)
+     {
+       super(key, outproc, iv);
+       this.outproc(iv);
+       this.saved = new Array(16);
+       this.hasout = false;
+     }
+ 
+     output(arr)
+     {
+       if(this.hasout) this.outproc(this.saved);
+       _blockcopy(this.saved, arr);
+       this.hasout = true;
+     }
+     seeend()
+     {
+       if(!this.hasout) {
+         for(var i = 0; i < 16; i++) this.put_byte(0);
+       }
+       if(this.oidx == 0) {
+         this.outproc(this.saved);
+         return true;
+       } else {
+         return false;
+       }
+       
+     }
+   }
+   
+   class _BlockDecodeSteal extends _BlockDecodeBase {
+     constructor(key, outproc)
+     {
+       super(key, outproc);
+       this.next = new Array(16);
+       this.hasread = false;
+     }
+     output(arr)
+     {
+       this.outproc(arr);
+     }
+     _do_decode_block()
+     {
+       if(this.hasread) {
+         if(this.hasreadiv) {
+           this.decode_block();
+         } else {
+           _blockcopy(this.iv, this.next);
+           this.hasreadiv = true;
+         }
+       } else {
+         this.hasread = true;
+       }
+       _blockcopy(this.next, this.out);
+       _blockzero(this.out);
+       this.oidx = 0;
+     }
+   }
+   
+   class OFBEncode extends _BlockEncodeFB {
+     constructor(key, outproc, iv)
+     {
+       super(key, outproc, iv);
+       this.ciphernum = OFB;
+     }
+   
+     encode_block()
+     {
+       this.cipher(this.iv);
+       _blockxor(this.out, this.iv);
+       this.output(this.out);
+     }
+   
+     end()
+     {
+       if(this.oidx == 0) return;
+       this.cipher(this.iv);
+       _blockxor(this.out, this.iv);
+       this.out.length = this.oidx;
+       this.output(this.out);
+     }
+   }
+   
+   class OFBDecode extends _BlockDecodeFB {
+     constructor(key, outproc)
+     {
+       super(key, outproc);
+     }
+   
+     decode_block()
+     {
+       this.cipher(this.iv);
+       _blockxor(this.out, this.iv);
+       this.output(this.out);
+     }
+   
+     end()
+     {
+       if(this.oidx == 0) return;
+       this.cipher(this.iv);
+       _blockxor(this.out, this.iv);
+       this.out.length = this.oidx;
+       this.output(this.out);
+     }
+   }
+   
+   class CFBDecode extends _BlockDecodeFB {
+     constructor(key, outproc)
+     {
+       super(key, outproc);
+     }
+   
+     decode_block()
+     {
+       this.cipher(this.iv);
+       _blockxor(this.iv, this.out);
+       this.output(this.iv);
+       _blockcopy(this.iv, this.out);
+     }
+   
+     end()
+     {
+       if(this.oidx == 0) return;
+       this.cipher(this.iv);
+       _blockxor(this.out, this.iv);
+       this.out.length = this.oidx;
+       this.output(this.out);
+     }
+   }
+   
+   class CFBEncode extends _BlockEncodeFB {
+     constructor(key, outproc, iv)
+     {
+       super(key, outproc, iv);
+       this.ciphernum = CFB;
+     }
+   
+     encode_block()
+     {
+       this.cipher(this.iv);
+       _blockxor(this.iv, this.out);
+       this.output(this.iv);
+     }
+   
+     end()
+     {
+       this.cipher(this.iv);
+       _blockxor(this.out, this.iv);
+       this.out.length = this.oidx;
+       this.output(this.out);
+     }
+   }
+   
+   
+   class CTREncode extends _BlockEncodeFB {
+     /*
+     Counter uses XOR
+     */
+     constructor(key, outproc, iv)
+     {
+       super(key, outproc, iv);
+       this.ciphernum = CTR;
+       this.count = 0;
+       this.wiv = new Array(16);
+     }
+   
+     encode_block()
+     {
+       apply_count(this.wiv, this.iv, this.count);
+       this.cipher(this.wiv);
+       _blockxor(this.out, this.wiv);
+       this.output(this.out);
+       this.count += 1;
+     }
+     end()
+     {
+       apply_count(this.wiv, this.iv, this.count);
+       this.cipher(this.wiv);
+       _blockxor(this.out, this.wiv);
+       this.out.length = this.oidx;
+       this.output(this.out);
+     }
+   }
+   class CTRDecode extends _BlockDecodeFB {
+     /*
+     Counter uses XOR
+     */
+     constructor(key, outproc)
+     {
+       super(key, outproc);
+       this.count = 0;
+       this.wiv = new Array(16);
+     }
+     output(arr)
+     {
+       this.outproc(arr);
+     }
+   
+     decode_block()
+     {
+       apply_count(this.wiv, this.iv, this.count);
+       this.cipher(this.wiv);
+       _blockxor(this.out, this.wiv);
+       this.output(this.out);
+       this.count += 1;
+     }
+     end()
+     {
+       apply_count(this.wiv, this.iv, this.count);
+       this.cipher(this.wiv);
+       _blockxor(this.out, this.wiv);
+       this.out.length = this.oidx;
+       this.output(this.out);
+     }
+   }
+   
+   class CBCEncode extends _BlockEncodeSteal {
+     constructor(key, outproc, iv)
+     {
+       super(key, outproc, iv);
+       this.ciphernum = CBC;
+     }
+   
+     encode_block()
+     {
+       _blockxor(this.iv, this.out);
+       this.cipher(this.iv);
+       this.output(this.iv);     // Writes it to "Saved"
+     }
+   
+     end()
+     {
+       if(this.seeend()) return;
+   
+       for(var i = 0; i < this.oidx; i++) {
+         this.out[i] ^= this.iv[i];
+       }
+       for(var i = this.oidx; i < 16; i++) {
+         this.out[i] = this.iv[i];
+       }
+       this.cipher(this.out);
+       // I will "SWAP" the last 2 blocks
+   
+       this.outproc(this.out);
+       this.saved.length = this.oidx;
+       this.outproc(this.saved);
+     }
+   }
+   
+   class CBCDecode extends _BlockDecodeSteal {
+     constructor(key, outproc)
+     {
+       super(key, outproc);
+       this.work = new Array(16);
+     }
+   
+     decode_block()
+     {
+       _blockcopy(this.work, this.next);
+       this.decipher(this.next);
+       _blockxor(this.next, this.iv);  // Old is previous block
+       this.output(this.next);
+       _blockcopy(this.iv, this.work);
+     }
+   
+     end()
+     {
+       // This.out is what has been read
+       // this.next is what was there before
+       // hasread should always be true
+       if(!this.hasread) return;     // Just in case
+       if(this.oidx == 0) {
+         this.decipher(this.next);
+         _blockxor(this.next, this.iv);
+         this.output(this.next);
+       } else {
+         this.decipher(this.next);
+   
+         for(var i = 0; i < this.oidx; i++) {
+           this.next[i] ^= this.out[i];    // Fixed end of message
+         }
+   
+         for(var i = this.oidx; i < 16; i++) {     // Give back
+           this.out[i] = this.next[i];
+         }
+   
+         this.decipher(this.out);
+         _blockxor(this.out, this.iv);
+   
+         this.outproc(this.out);
+         this.next.length = this.oidx;
+         this.outproc(this.next);
+       }
+     }
+   }
+   
+   class PCBCEncode extends _BlockEncodeSteal {
+     constructor(key, outproc, iv)
+     {
+       super(key, outproc, iv);
+       this.ciphernum = CBC;
+     }
+   
+     encode_block()
+     {
+   
+       _blockxor(this.iv, this.out);
+       this.cipher(this.iv);
+       this.output(this.iv);     // Writes it to "Saved"
+       _blockxor(this.iv, this.out);
+       
+     }
+   
+     end()
+     {
+       if(this.seeend()) return;
+   
+       for(var i = 0; i < this.oidx; i++) {
+         this.iv[i] ^= this.out[i];
+       }
+       this.cipher(this.iv);
+   
+       for(var i = 0; i < this.oidx; i++) {
+         this.iv[i] ^= this.out[i];
+       }
+       // I will "SWAP" the last 2 blocks
+   
+       this.outproc(this.iv);
+   
+       this.saved.length = this.oidx;
+       this.outproc(this.saved);
+     }
+   }
+   
+   class PCBCDecode extends _BlockDecodeSteal {
+     constructor(key, outproc)
+     {
+       super(key, outproc);
+       this.work = new Array(16);
+     }
+   
+     decode_block()
+     {
+       /*
+       The "saved" is same as "iv" for CBC
+       */
+       
+       if(this.hasread) {
+         _blockcopy(this.work, this.next);
+         this.decipher(this.next);
+         _blockxor(this.iv, this.next);  // Old is previous block
+         this.output(this.iv);
+         _blockxor(this.iv, this.work);
+       } else {
+         this.hasread = true;
+       }
+       _blockcopy(this.next, this.out);
+   
+     }
+   
+     end()
+     {
+       // This.out is what has been read
+       // this.next is what was there before
+       // hasread should always be true
+       if(!this.hasread) return;     // Just in case
+       if(this.oidx == 0) {
+         this.decipher(this.next);
+         _blockxor(this.next, this.iv);
+         this.output(this.next);
+       } else {
+         // Decipher the last block first (which is second last one read)
+   
+         this.decipher(this.next);
+   
+         for(var i = 0; i < this.oidx; i++) {
+           this.next[i] ^= this.out[i];    // Fixed end of message
+         }
+   
+         // Unsteal
+         for(var i = this.oidx; i < 16; i++) {     // Give back
+           this.out[i] = this.next[i];
+         }
+   
+         this.decipher(this.out);
+   
+         _blockxor(this.out, this.iv);
+   
+         this.outproc(this.out);
+         this.next.length = this.oidx;
+         this.outproc(this.next);
+       }
+     }
+   }
+   
+   class CTRBEncode extends _BlockEncodeSteal {
+     constructor(key, outproc, iv)
+     {
+       super(key, outproc, iv);
+       this.ciphernum = CTRB;
+       this.count = 0;
+       this.wiv = new Array(16);
+     }
+   
+     encode_block()
+     {
+       apply_count(this.wiv, this.iv, this.count);
+       this.count += 1;
+       _blockxor(this.out, this.wiv);
+       this.cipher(this.out);
+       this.output(this.out);     // Writes it to "Saved"
+     }
+   
+     end()
+     {
+       if(this.seeend()) return;
+   
+       apply_count(this.wiv, this.iv, this.count);
+
+       for(var i = 0; i < this.oidx; i++) {
+         this.out[i] ^= this.wiv[i];
+       }
+       for(var i = this.oidx; i < 16; i++) {
+         this.out[i] = this.saved[i];
+       }
+       this.cipher(this.out);
+       // I will "SWAP" the last 2 blocks
+   
+       this.outproc(this.out);
+       this.saved.length = this.oidx;
+       this.outproc(this.saved);
+     }
+   }
+   
+   class CTRBDecode extends _BlockDecodeSteal {
+     constructor(key, outproc)
+     {
+       super(key, outproc);
+       this.work = new Array(16);
+       this.wiv = new Array(16);
+       this.count = 0;
+     }
+   
+     decode_block()
+     {
+       /*
+       The "saved" is same as "iv" for CBC
+       */
+       
+       this.decipher(this.next);
+       apply_count(this.wiv, this.iv, this.count);
+       this.count += 1;
+       _blockxor(this.next, this.wiv);  // Old is previous block
+       this.output(this.next);
+   
+     }
+   
+     end()
+     {
+       // This.out is what has been read
+       // this.next is what was there before
+       // hasread should always be true
+       if(!this.hasread) return;     // Just in case
+       if(this.oidx == 0) {
+         this.decipher(this.next);
+         apply_count(this.wiv, this.iv, this.count);
+         _blockxor(this.next, this.wiv);
+         this.output(this.next);
+       } else {
+         this.decipher(this.next);
+         this.count += 1;
+         apply_count(this.wiv, this.iv, this.count);
+   
+         for(var i = 0; i < this.oidx; i++) {
+           this.next[i] ^= this.wiv[i];    // Fixed end of message
+         }
+   
+         for(var i = this.oidx; i < 16; i++) {     // Give back
+           this.out[i] = this.next[i];
+         }
+   
+         this.decipher(this.out);
+
+         this.count -= 1;
+         apply_count(this.wiv, this.iv, this.count);
+
+         _blockxor(this.out, this.wiv);
+   
+         this.outproc(this.out);
+         this.next.length = this.oidx;
+         this.outproc(this.next);
+       }
+     }
+   }
+   
+   /*
+    * Need to pass at least two bytes into inbuf
+    */
+   function getDecode(key, output, inbuf)
+   {
+     const magic = new Array(16);
+     for(let i = 0; i < 16; i++) magic[i] = inbuf[i];
+     (new _AES(key)).decipher(magic);
+       
+     const sha = new SHA256();
+     sha.putbytes(magic);
+     sha.putbytes(key);
+     const usekey = sha.finalize().toByteArray();
+ 
+     let blk = null;
+ 
+     const ver = magic[0];
+     const num = (magic[1] & 0xe0) >> 5;
+     if(ver == 1) {
+       switch (num) {
+       case OFB:
+         blk = new OFBDecode(usekey, output);
+         break;
+       case CFB:
+         blk = new CFBDecode(usekey, output);
+         break;
+       case CTR:
+         blk = new CTRDecode(usekey, output);
+         break;
+       case CBC:
+         blk = new CBCDecode(usekey, output);
+         break;
+       case PCBC:
+         blk = new PCBCDecode(usekey, output);
+         break;
+       case CTRB:
+         blk = new CTRBDecode(usekey, output);
+         break;
+       }
+     }
+     if(blk === null) {
+       console.trace();
+       alert("Invalid keys, or not generated by version 1 of INCrypt");
+       throw("Invalid keys, or not generated by version 1 of INCrypt");
+     }
+     blk.ciphernum = num;
+     return blk;
+   }
+     
+   function getEncode(num, key, output)
+   {
+ 
+     const iv = entropy.getblock();
+ 
+     iv[0] = 1;
+     iv[1] = num << 5;
+ 
+     const sha = new SHA256();
+     sha.putbytes(iv);
+     sha.putbytes(key);
+     const usekey = sha.finalize().toByteArray();
+ 
+     (new AES.AES(key)).cipher(iv);
+ 
+     let blk;
+   
+     switch (num) {
+     case OFB:
+       blk = new OFBEncode(usekey, output, iv);
+       break;
+     case CFB:
+       blk = new CFBEncode(usekey, output, iv);
+       break;
+     case CTR:
+       blk = new CTREncode(usekey, output, iv);
+       break;
+     case CBC:
+       blk = new CBCEncode(usekey, output, iv);
+       break;
+     case PCBC:
+       blk = new PCBCEncode(usekey, output, iv);
+       break;
+     case CTRB:
+       blk = new CTRBEncode(usekey, output, iv);
+       break;
+     default:
+       console.trace();
+       throw("Unknown cipher number");
+       break;
+     }
+     return blk;
+   }
+     
+   
+   return {
+     getDecode: getDecode,
+     getEncode: getEncode,
+     OFB: OFB,
+     CFB: CFB,
+     CTR: CTR,
+     CBC: CBC,
+     AES: _AES   // For th RAW class
+     }
+   }();
+ 
+   const EC = function()
+   {
+     
+     /*
+      * Eliptical Curve Stuff
+      * SEC256KI
+      */
+     
+     const C_PRIME = new LBigint("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
+     const C_B = new LBigint("0000000000000000000000000000000000000000000000000000000000000007");
+     const C_A = new LBigint("0000000000000000000000000000000000000000000000000000000000000000");
+     const C_GX = new LBigint("79BE667EF9DCBBAC55a06295CE870B07029BFCDB2DCE28D959F2815B16F81798");
+     const C_GY = new LBigint("483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8");
+     const C_GORDER = new LBigint("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+     
+     // Following in bytes
+     const E_PUBKEY_D = 65;
+     const E_PUBKEY_S = 33;
+     const E_PUBKEY_SIZE = 32;
+ 
+     const E_KEY_BYTES = 32
+     const E_KEY_BITS = E_KEY_BYTES << 3;
+     
+     
+     class Curve {
+       constructor(prime, c_a, c_b, g_x, g_y, g_order) {
+     
+         // Put in defaults
+     
+         if(!prime) prime = C_PRIME;
+         if(!c_a) c_a = C_A;
+         if(!c_b) c_b = C_B;
+         if(!g_x) g_x = C_GX;
+         if(!g_y) g_y = C_GY;
+         if(!g_order) g_order = C_GORDER;
+     
+     
+         this.infinity = new Point(this, null, null, null);
+     
+         this.p = prime;
+         this.a = c_a;
+         this.b = c_b;
+         
+         this.generator = new Point(this, g_x, g_y, null);
+         this.generator.order = g_order;
+     
+         this.g_x = g_x;
+         this.g_y = g_y;
+         this.g_order = g_order;
+     
+         let pp2 = this.generator.multiply(g_order)
+     
+         if(pp2.x !== null || pp2.x !== null)
+           throw("Gnerator * order != infinity")
+     
+       }
+     
+       contains_point(x, y)
+       {
+     
+         // return ( y * y - ( (x * x * x) + (self.__a * x) + self.__b ) ) % self.__p == 0
+     
+         let an1 = y.copy().powmodi(2, this.p);
+         let an2 = x.copy().powmodi(3, this.p);
+         let an3 = this.a.copy().multiply(x)
+     
+         an2.add(an3);
+         an2.add(this.b);
+         an1.subtract(an2);
+     
+         an1.mod(this.p);
+         return an1.iszero();
+       }
+     
+       get_position(x, lastbitset)
+       {
+         // y = Mod.sqrt((x * x * x) + (self.__a * x) + self.__b,  self.__p)
+       
+         let xxx = x.copy().powmodi(3, this.p);
+         let ax = this.a.copy().multiply(x).mod(this.p);
+     
+         let y = xxx.add(ax).add(ax).add(this.b);
+         y.sqrt(this.p);
+     
+         if(y.iszero()) {
+           throw("Invalid X coordinate in get_position");
+         }
+     
+         if(typeof lastbitset == "undefined") {
+           return [Point(x, y), Point(x, this.p.copy().subtract(y))];
+         } else {
+           let z;
+           if(y.getbit(0) == lastbitset) {
+             z = y;
+           } else {
+             z = this.p.copy().subtract(y);
+           }
+           return [Point(x, y)];
+         }
+       }
+     
+       /*
+        * The public key is a point.
+        * I am getting this from a bigint for now
+        */
+       pubkey_from_bigint(a)
+       {
+         // Keys are 32 or 64 bytes, plus a lead byte , which is up 2 3 bits long
+         // Which is 44 6 bit numers, or 86  for longer one
+     
+         let bl = a.bytelen();
+         let x;
+         let y;
+         let lastbitset;
+         switch(bl) {
+         case E_PUBKEY_S:
+           switch( a.getbyte(E_PUBKEY_S - 1)) {
+           case 2:
+             x = a.getbytes(0, E_PUBKEY_SIZE);
+             y = new LBigint("");
+             lastbitset  = false;
+             break;
+           case 3:
+             x = a.getbytes(0, E_PUBKEY_SIZE);
+             y = new LBigint("");
+             lastbitset = true;
+             break;
+           default:
+             throw("Unknown header number for small public key");
+             break;
+           }
+           break;
+         case E_PUBKEY_D:
+           switch( a.getbyte(E_PUBKEY_D - 1)) {
+           case 4:
+             x = a.getbytes(E_PUBKEY_SIZE, E_PUBKEY_SIZE);
+             y = a.getbytes(0, E_PUBKEY_SIZE);
+             lastbitset = null;
+           default:
+             throw("Unknown header number for large public key");
+             break;
+           }
+           break;
+         default:
+           throw("Unknown number size public key");
+           break;
+         }
+         return new Point(x, y, lastbitset);
+       }
+     
+           
+       signature_from_bigint(a)
+       {
+         let r = a.getbytes(C_PUBKEY_SIZE, C_PUBKEY_SIZE);
+         let s = a.getbytes(0, C_PUBKEY_SIZE);
+     
+         return new Signature(r, s);
+       }
+     }
+     
+     
+     class Point {
+       constructor(curve, x, y, lastbit)
+       {
+         this.curve = curve;
+     
+         // Is infinity
+         if(x === null && y === null) {
+           this.x = null;
+           this.y = null;
+           return;
+         }
+ 
+         if(x == null) x = new LBigint(0);
+         if(y == null) y = new LBigint(0);
+ 
+         if(x.iszero()) {
+           if (y.iszero()) {
+             throw("Invalid point arguments");
+           }
+           lastbit = null;
+         } else if (y.iszero()) {
+           y = this._calc_y(x);
+           if (y.getbit(0) != lastbit) {
+             y.subtract(curve.p).abs();
+           }
+         } else if (!curve.contains_point(x, y)) {
+           console.trace();
+           console.log(x.toString(), y.toString());
+           throw("X, Y is not in curve")
+         }
+     
+         this.curve = curve;
+     
+         this.x = LBigint.copyit(x);
+         this.y = LBigint.copyit(y);
+         this.order = null;
+         this.lastbit = lastbit;
+     
+       }
+     
+       equals(other)
+       {
+         if(this.x === null && this.y === null && other.x === null && oterh.y === null) 
+           return true;
+         else if((this.x instanceof LBigint) && (this.y instanceof LBigint) && (other.x instanceof LBigint) && (other.y instanceof LBigint))
+           if((this.x.cmp(this.y) == 0) && this.y.cmp(other.y)) 
+             return true;
+           else
+             return false;
+         else
+           return false;
+       }
+     
+       _calc_y(x)
+       {
+         /*
+         Calculate y and lastbit from x
+         */
+         
+         let xxx = x.copy().powmodi(3, this.curve.p);
+         let ax = this.curve.a.copy().multiply(x).mod(this.curve.p);
+     
+         let y = xxx.add(ax).add(this.curve.b).mod(this.curve.p).sqrt(this.curve.p);
+     
+         if (y.iszero())
+           throw("Invalid X coordinate in compressed point");
+         return y;
+       }
+     
+       copy()
+       {
+         return new Point(this.curve, this.x, this.y, this.lastbit)
+       }
+     
+       isinfinity()
+       {
+         return (this.x === null && this.y === null)
+       }
+     
+       add(other)
+       {
+         /*
+         Add 2 points together
+         */
+         let p = this.curve.p;
+         if (other.equals(this.curve.infinity)) return other;
+         if(this.x.cmp(other.x) == 0) {
+           if(this.y.copy().add(other.y).mod(p).iszero()) {
+             return this.curve.infinity;
+           } else {
+             return this.tdouble();
+           }
+         }
+     
+         let l = (other.y.copy().subtract(this.y)).multiply((other.x.copy().subtract(this.x)).inverse(p)).mod(p)
+         let x3 = (l.copy().multiply(l)).subtract(this.x).subtract(other.x).mod(p)
+         let y3 = (l.copy().multiply((this.x.copy()).subtract(x3))).subtract(this.y).mod(p)
+     
+         return new Point(this.curve, x3, y3)
+       }
+     
+       multiply(other)
+       {
+         /*
+         """
+         Multiply a point by an integer
+         """
+         */
+     
+         let e = other.copy();
+         if(this.order != null) e.mod(this.order)
+     
+         if(e.iszero())
+           return new Point(this.curve, null, null, null);     // Infinity
+     
+         if(this.x === null && this.y === null)
+           return new Point(this.curve, null, null, null);     // Infinity
+     
+         if(e.s_neg) throw("e cannot be negative in multiply");
+     
+         let e3 = e.copy().multiplyi(3);
+         let negative_self = new Point(this.curve, this.x, this.curve.p.copy().subtract(this.y));
+         negative_self.order = this.order;
+ 
+         let i  = e3.bitlen() - 1;
+         
+         let result = this.copy();
+         while(i > 1) {
+           i--;
+           result = result.tdouble();
+           let t3 = e3.getbit(i);
+           let te = e.getbit(i);
+           if(t3 && (!te))  result = result.add(this);
+           if(te && (!t3))  result = result.add(negative_self);
+         }
+         return result;
+       }
+     
+       tdouble()
+       {
+         if(this.isinfinity()) return this.copy();
+     
+         let p = this.curve.p;
+         let a = this.curve.a;
+     
+         let l = (this.x.copy().multiplyi(3).multiply(this.x).add(a)).multiply((this.y.copy().multiplyi(2)).inverse(p)).mod(p);
+         let x3 = (l.copy().multiply(l)).subtract((this.x.copy().multiplyi(2))).mod(p);
+         let y3 = ((l.copy().multiply((this.x.copy().subtract(x3)))).subtract(this.y)).mod(p)
+         return new Point(this.curve, x3, y3, null);
+       }
+       toArray()
+       {
+         let arr = new Array();
+         if(this.y.getbit(0)) {
+           arr.push(3)
+         } else {
+           arr.push(2);
+         }
+         for(let a of this.x.toArray()) arr.push(a);
+         return arr;
+       }
+       static fromArray(curve, arr)
+       {
+         if(arr.length < 2) throw("Array WAY too short");
+ 
+         let lastbit;
+         if(arr[0] == 2) {
+           lastbit = false;
+         } else if (arr[0] == 3) {
+           lastbit = true;
+         } else {
+           throw("Unknown header");
+         }
+ 
+         let x = new LBigint(arr.slice(1));
+ 
+         return new Point(curve, x, null, lastbit);
+       }
+     }
+     
+     class Signature {
+       /*
+       A signature is a point on the curve that is
+       k * G = point x, y
+       r = x mod N
+       s = (1/k) (hash + (r * priv)) mod N
+       */
+     
+       constructor(sig_r, sig_s)
+       {
+         this.r = sig_r;
+         this.s = sig_s;
+       }
+     
+       verify(hashnum, public_key)
+       {
+         /*
+         Verifies a hash with a signature
+         */
+         if(!(hashnum instanceof LBigint)) hashnum = new LBigint(hashnum);
+         if(public_key) {
+           this.public_key = public_key;
+         }
+         if(!this.public_key) {
+           throw("Need a public key for verifying signature");
+         }
+         let gorder = public_key.curve.g_order;
+     
+         if(this.r.cmp(new LBigint(1)) < 0 || this.r.cmp(gorder) >= 1 || this.s.cmp(new LBigint(1)) < 0 || this.s.cmp(gorder) >= 1) {
+           // Invalid signature
+           return false; 
+         }
+     
+         let sig_si = this.s.copy().inverse(gorder);
+         let f_u1 = hashnum.copy().multiply(sig_si).mod(gorder);
+         let f_u2 = this.r.copy().multiply(sig_si).mod(gorder);
+         let point_v = (public_key.curve.generator.multiply(f_u1)).add((this.public_key.multiply(f_u2)));
+     
+         return this.r.cmp(point_v.x.copy().mod(gorder)) == 0;
+       }
+       get()
+       {
+         return [this.r.toString(), this.s.toString()];
+       }
+ 
+       toArray()
+       {
+         let rout = new Array();
+         let sout = new Array();
+         for(let a of this.r.toArray()) rout.push(a);
+         for(let a of this.s.toArray()) sout.push(a);
+ 
+         while(rout.length < 32) rout.unshift(0);
+         while(sout.length < 32) sout.unshift(0);
+ 
+         for(let a of sout) rout.push(a);
+         return rout;
+       }
+ 
+       static fromArray(arr)
+       {
+         if(arr.length != 64) {
+           console.trace();
+           throw("Expected 64 array length for signature")
+         }
+         return new Signature(
+           new LBigint(arr.slice(0, 32)),
+           new LBigint(arr.slice(32, 64)));
+       }
+     }
+     
+     
+     class PrivateKey {
+       constructor(curve, secret)    // Secret is "LBigint"
+       {
+         this.curve = curve;
+         if(!secret) {
+           secret = new LBigint(entropy.gethash());
+         } else {
+           if(secret) if (!(secret instanceof LBigint)) secret = new LBigint(secret);
+         }
+     
+         // If secret is to high, just divide by 2 until it is not
+         while(secret.cmp(C_GORDER) >=  0) {
+           secret.rightbitshift();
+         }
+     
+         this.secret = secret;
+         this.pubkey = null;
+         this.gorder = curve.generator.order;
+         if(!this.gorder) throw("Generator point must have an order");
+         if(this.secret) this.gen_public();
+       }
+     
+       gen_public()
+       {
+         this.pubkey = this.curve.generator.multiply(this.secret);
+         if(!this.pubkey.multiply(this.gorder).isinfinity()) throw("Generator point order is bad");
+     
+         let x = this.pubkey.x;
+         let y = this.pubkey.y;
+     
+         if ((x.sign() < 0) || (this.gorder.cmp(x) <= 0) || (this.gorder.cmp(y) <= 0))
+           throw("Generator poin has x or y out of range");
+       }
+     
+       sign(hashnum)
+       {
+         // Signs hashnum with private key
+     
+           
+         const self = this;
+     
+         if(!(hashnum instanceof LBigint)) hashnum = new LBigint(hashnum);
+     
+         let gorder = this.curve.generator.order;
+     
+         while(hashnum.cmp(gorder) > 0) hashnum.righbitshift();
+     
+         let sig_s;
+         let sig_r;
+         let point_r;
+         for(;;)
+         {
+           let num_k;
+           for(;;)
+           {
+             num_k = new LBigint(entropy.gethash());
+             if(num_k.cmp(gorder) < 0) break;
+           }
+           point_r = this.curve.generator.multiply(num_k);
+           sig_r = point_r.x;
+           if(sig_r.iszero()) continue;
+           sig_s = num_k.copy().inverse(gorder).multiply((hashnum.copy().add((this.secret.copy().multiply(sig_r)).mod(gorder)))).mod(gorder);
+           if(sig_s.iszero()) continue;
+           break;
+         }
+         return new Signature(sig_r, sig_s);
+       }
+     
+       getdh(other)
+       {
+         // Gets the Diffie Helman secret using other public key
+         return other.multiply(this.secret);
+       }
+     }
+ 
+     return {
+       Curve: Curve,
+       Point: Point,
+       PrivateKey: PrivateKey,
+       Signature: Signature
+     };
+       
+   }();
+ 
+   class Secretpage {
+     constructor(isnameid, tword, intro, genfun, clearfun)
+     {
+       this.tword = tword;
+       this.intro = intro;
+       this.genfun = genfun;  // Generate function
+   
+       this.ishidden = false;
+       this.isgenerated = false;
+   
+       let fnameid;
+   
+       if(isnameid) {
+         fnameid = doele("input", {type: "text", name: "nameid", "class": "nameid"}, "", null);
+       } else {
+         fnameid = null;
+       }
+       const fpasstext = doele("textarea", {"class": "passtext texthide", cols: 40, rows: 10, name: "passtext"}, "", null);
+       const fpassword = doele("input", {"class": "password", type: "password"}, "", null);
+   
+       this.isnameid = fnameid;
+       this.fpasstext = fpasstext;
+       this.fpassword = fpassword
+       this.fnameid = fnameid;
+   
+       const buthide = doele("input", {"class": "butsecret", type: "button", value: "Hide Secrets"}, "", null);
+       const butshow = doele("input", {"class": "butsecret", type: "button", value: "Show Secrets"}, "", null);
+       const showtext = doele("input", {"class": "showtext", type: "checkbox", value: false}, "", null);
+       const showpass = doele("input", {"class": "showpass", type: "checkbox", value: false}, "", null);
+       const butgen = doele("input", {"class": "butgen", type: "button", value: "Generate"}, "", null);
+   
+       this.showtext = showtext;
+       this.showpass = showpass;
+       this.buthide = buthide;
+       this.butshow = butshow;
+   
+       const fields = [intro];
+       if(isnameid) {
+ 
+         fields.push(gettentry("Name/ID/Email", [this.fnameid]));
+       }
+   
+       fields.push(gettentry(tword + " text", [this.fpasstext], [showtext, doele("span", {}, " Show?", null)]));
+       fields.push(gettentry(tword + " password", [this.fpassword], [showpass, doele("span", {}, " Show?", null)]));
+       fields.push(gettentry(null, [butgen]));
+   
+       const secdiv = doele("div", {"class": "secrets"}, "", fields);
+       this.secdiv = secdiv;
+   
+       this.outele = doele("div", {}, "", [
+         gettentry(null, [butshow, buthide]),
+         secdiv,
+       ]);
+   
+       const self = this;
+   
+       buthide.addEventListener("click", function(e) {
+         if(self.validate(false)) self.generate();
+         self.sechide();
+       });
+   
+       butshow.addEventListener("click", function(e) {
+         clearfun();
+         self.ishidden = false;
+         self.isgenerated = false;
+         self.secshow();
+       });
+ 
+       showtext.addEventListener("change", function(e) {
+         if(e.target.checked) {
+           fpasstext.className = "passtext textshow";
+         } else  {
+           fpasstext.className = "passtext texthide";
+         }
+       });
+   
+       showpass.addEventListener("change", function(e) {
+         if(e.target.checked) {
+           fpassword.type = "text";
+         } else  {
+           fpassword.type = "password";
+         }
+       });
+   
+       butgen.addEventListener("click", function(e) {
+         if(self.validate(true)) self.generate();
+       });
+       this.secshow();
+     }
+   
+     hidefields()
+     {
+       this.fpasstext.className = "passtext texthide";
+       this.fpassword.type = "password";
+       this.showtext.checked = false;
+       this.showpass.checked = false;
+     }
+   
+     validate(showmess)
+     {
+       if(this.isnameid) {
+         if(this.fnameid.value.trim() == "") {
+           
+           if(showmess) alert("Name/ID/Email must be entered");
+           return false;
+         }
+       } else {
+         if(this.fpasstext.value.trim() == "") {
+           if(showmess) alert("Pass text value must be entered");
+           return false;
+         }
+       }
+       return true;
+     }
+     generate()
+     {
+       if(this.ishidden) return;
+       // Validate
+   
+       this.hidefields();
+   
+       if(!this.validate(true)) {
+         clearfun();
+         return false;
+       }
+   
+       const sha = new SHA256();
+       if(this.isnameid) {
+         sha.write_field(this.fnameid.value);
+         sha.putbyte(10);
+       }
+       sha.write_field(this.fpasstext.value);
+       sha.putbyte(10);
+       sha.write_field(this.fpassword.value);
+       sha.putbyte(10);
+       this.ishidden = true;
+       this.genfun(sha.finalize().toByteArray());
+       this.isgenerated = true;
+       this.sechide();
+     }
+ 
+     sechide()
+     {
+       this.secdiv.style.display = "none";
+       this.buthide.style.fontWeight = "bold";
+       this.butshow.style.fontWeight = "normal";
+       this.hidefields();
+     }
+ 
+     secshow()
+     {
+       this.secdiv.style.display = "block";
+       this.buthide.style.fontWeight = "normal";
+       this.butshow.style.fontWeight = "bold";
+     }
+       
+     display()
+     {
+       return this.outele;
+     }
+   }
+ 
+   // Utilities needed more than once
+ 
+   function to_fingureprint(arr)
+   {
+     function _o(_b)
+     {
+       if(_b < 16) {
+         return "0" + _b.toString(16);
+       } else {
+         return _b.toString(16);
+       }
+     }
+ 
+     let j = 0;
+     let out = "";
+     for(let i = 0; i < 4; i++) {
+       out += _o(arr[j++]);
+       out += _o(arr[j++]);
+       out += ":"
+       out += _o(arr[j++]);
+       out += _o(arr[j++]);
+       if(i < 3) out += " | "
+     }
+     return out;
+   }
+ 
+   // Introduction Block 
+   dummy(function()
+   {
+     // Prime the "countdown" for entropy
+ 
+     let cdown = 30;
+     const but = document.getElementById("ii_continue");
+     const div = document.getElementById("ii_intro");
+     const rdiv = document.getElementById("ii_rest");
+     const cspan = document.getElementById("ii_span");
+ 
+     function _cd(e)
+     {
+       cdown -= 1;
+       if (cdown <= 0) {
+         but.value = "Continue to IM Crypto..";
+         cspan.innerText = "Continue:"
+         
+         but.disabled = false;
+         div.removeEventListener("mousedown", _cd);
+         div.removeEventListener("touchstart", _cd);
+         but.removeEventListener("mousedown", _cd);
+         but.removeEventListener("touchstart", _cd);
+         but.addEventListener("click", function(e) {
+           div.style.display="none";
+           rdiv.style.display="block";
+         });
+         
+       } else {
+         cspan.innerText = cdown.toString() + " 'taps' to go: ";
+       }
+     }
+     div.addEventListener("mousedown", _cd);
+     div.addEventListener("touchstart", _cd);
+     but.addEventListener("mousedown", _cd);
+     but.addEventListener("touchstart", _cd);
+   }());
+ 
+ 
+   // Menu options
+   dummy(function()
+   {
+ 
+     const mm_options = document.getElementById("mm_options");
+     const divopts = [opt_sharedsecret, opt_publickey, opt_pubencrypt, opt_signkey, opt_verify];
+ 
+     function fun_invisible()
+     {
+       for(let div of divopts) div.style.display = "none";
+     }
+ 
+     fun_invisible();
+ 
+     mm_options.addEventListener("change", function(e) {
+       var fun = {
+         chooseone: function () {fun_invisible();},
+         sharedsecret: function () 
+         {
+           fun_invisible();
+           opt_sharedsecret.style.display = "block";
+         },
+         publickey: function()
+         {
+           fun_invisible();
+           opt_publickey.style.display = "block";
+         },
+         pubencrypt: function()
+         {
+           fun_invisible();
+           opt_pubencrypt.style.display = "block";
+         },
+         signkey: function()
+         {
+           fun_invisible();
+           opt_signkey.style.display = "block";
+         },
+         verify: function()
+         {
+           fun_invisible();
+           opt_verify.style.display = "block";
+         },
+       }[e.target.value];
+       if(fun) fun();
+     });
+ 
+   }());
+ 
+   // The "Shared Secret" Stuff
+   dummy(function()
+   {
+ 
+     let introtext = "One off shared secrets between yourself and the partner(s) of this conversation.  Do " +
+              "not use the same information in your \"Private/Public Key Secrets\".";
+ 
+     let intro = doele("div", {"class": "intro"}, "", [
+       doele("div", {"class": "introline"}, introtext, null),
+       doele("hr", {"class": "introsep"}, "", null)
+     ]);
+       
+     let secrettext = "";
+     let secretpass = "";
+ 
+     let ishidden = false;
+ 
+     const fingureprint = doele("span", {"class": "fingureprint"}, "", null);
+ 
+     const secrets = new Secretpage(false, "Secret", intro, ss_genkey, ss_clearkey);
+ 
+     let wkey = null;
+ 
+     document.getElementById("ss_screen").appendChild(doele("div", {}, "", [
+       secrets.display(),
+       gettentry("Publishable (Hashed) Secret Fingureprint:", [fingureprint]),
+       getcodepage(function() { return wkey;}, ss_precheck, function() {secrets.sechide();})
+     ]));
+ 
+     function ss_precheck()
+     {
+       if(!secrets.validate(true)) return;
+       secrets.generate();
+       if(wkey == null) {
+         alert("Secret text and/or password need to be entered");
+         return false;
+       } else {
+         return true;
+       }
+     }
+ 
+     function ss_clearkey()
+     {
+       fingureprint.innerText = "";
+       wkey = null;
+     }
+ 
+     function ss_genkey(ikey)
+     {
+       const sha = new SHA256();
+       sha.initialize();
+       sha.putbytes(ikey);
+       const fkey = sha.finalize().toByteArray();
+       let fp = "";
+       let k = 0;
+       entropy.putbytes(fkey);
+       fingureprint.innerText = to_fingureprint(fkey);
+       wkey = ikey;
+     }
+ 
+   }());
+ 
+   // Have the curve here for now
+   const curve = new EC.Curve();
+   let privatekey = null;      // Need to store this somewhere
+ 
+ 
+   const privkeys = [];
+   function dispprivkeys(txt)
+   {
+     for(let p of privkeys) p.innerText = txt;
+   }
+ 
+   // Private/Public Key
+   dummy(function()
+   {
+     let secrettext = "";
+     let secretpass = "";
+     let secretname = "";
+ 
+     let ishidden = false;
+ 
+     const introtext = [ "Enter your secret stuff here.  Your private key is derived from the values you enter in " +
+               "these three fields, so remember them but do not tell anyone.  A trick to remembering them is " +
+               "to write these down on a piece of paper, sealing ot in an envelope and hiding the envelope somewhere.",
+ 
+               "The Name/ID/Email screen is to ensure uniqueness. it does not have to be your actual name/email. " +
+                "It never gets transmitted anywhere.",
+ 
+               'The "Key Text" is the "meat" of this.  Maybe a list of names, or a poem verse or the such.',
+               'The password is included because browsers tend not to "remember" them (unless prompted).']
+ 
+     const intros = [];
+     for(let t of introtext) {
+       intros.push(doele("div", {"class": "introline"}, t, null));
+       intros.push(doele("hr", {"class": "introsep"}, "", null));
+     }
+ 
+     const intro = doele("div", {"class": "intro"}, "", intros);
+ 
+     const fingureprint = doele("span", {"class": "fingureprint"}, "", null);
+     const publickey = doele("input", {type: "text", disabled: "yes", "class": "publickey", name: "publickey"}, "", null);
+     const privkey = doele("span", {"class": "privkey"}, "Not set", null);
+ 
+     privkeys.push(privkey);
+ 
+     const secrets = new Secretpage(true, "Key", intro, pk_dogenerate, pk_doclear);
+     document.getElementById("pk_screen").appendChild(
+       doele("div", {}, "", [
+         secrets.display(),
+         gettentry("Private Key Status", [privkey]),
+         gettentry("Public key", [publickey]),
+         gettentry("Public key fingureprint", [fingureprint])
+       ]));
+ 
+ 
+ 
+     function pk_doclear()
+     {
+       privatekey = null;
+       fingureprint.innerText = "";
+       publickey.value = "";
+       dispprivkeys("Not set");
+     }
+       
+     function pk_dogenerate(key)
+     {
+       privatekey = new EC.PrivateKey(curve, key);
+       dispprivkeys("Set and stored secretly");
+       let pubkey = privatekey.pubkey;
+ 
+       // Fingure print, I will just do X 
+ 
+       let bn = 15;
+       let fp = "";
+ 
+       function _o(_b)
+       {
+         if(_b < 16) {
+           return "0" + _b.toString(16);
+         } else {
+           return _b.toString(16);
+         }
+       }
+ 
+       let x = pubkey.x.toArray();
+       let y = pubkey.y.toArray();
+ 
+       entropy.putbytes(x);
+       entropy.putbytes(y);
+ 
+       fingureprint.innerText = to_fingureprint(x);
+ 
+       let cls = ToBase64;
+       publickey.value = cls.process(pubkey.toArray());
+       return true;
+     }
+   }());
+ 
+   // Public key encryption
+   dummy(function()
+   {
+     const privkey = doele("span", {"class": "privkey"}, "Not set", null);
+     const fingureprint = doele("span", {"class": "fingureprint"}, "", null);
+     const publickey = doele("input", {type: "text", "class": "publickey", name: "publickey"}, "", null);
+ 
+     privkeys.push(privkey);
+ 
+     let partnerpoint = null;       // The DH "Point"
+   
+     publickey.addEventListener("blur", function(e)
+     {
+       let fld = e.target;
+       if(fld.value.trim() == "") {
+         fingureprint.innerText = "";
+         point = null;
+         return;
+       }
+ 
+       let pass = true;
+ 
+       try {
+         let arr = FromBase64.process(fld.value);
+         if(arr.length < 16) {
+           throw("Too small for a public key");
+         }
+         partnerpoint = EC.Point.fromArray(curve, arr);
+         fingureprint.innerText = to_fingureprint(arr.slice(1));
+       } catch(err) {
+         alert("Cannot parse public key data.\n\nDetails: " + err.toString());
+         pass = false;
+       }
+       if(!pass) {
+         fld.value = "";
+         fingureprint.innerText = "";
+         partnerpoint = null;
+         return;
+       }
+ 
+       if(privatekey === null) {
+         alert("Warning: Private key has not been set up");
+       }
+     });
+ 
+     function check_settings()
+     {
+       if(partnerpoint === null) {
+         alert("Partner's public key not entered");
+         return false;
+       }
+       if(privatekey === null) {
+         alert("Your private key is not set");
+         return false;
+       }
+       return true;
+     }
+ 
+     function dokeys()
+     {
+       const dhpoint = privatekey.getdh(partnerpoint);
+       // I will just use X co=ordinate for diffie hellman
+       const dhkey = dhpoint.x.toArray();
+       while(dhkey.length < 32) dhkey.unshift(0);
+       return dhkey;
+     }
+ 
+     document.getElementById("pe_screen").appendChild(
+       doele("div", {}, "", [
+         gettentry("Your private key status:", [privkey]),
+         gettentry("Partner's public key:", [publickey]),
+         gettentry("Partner's public key's fingureprint:", [fingureprint]),
+         getcodepage(dokeys, check_settings, null)
+       ]));
+ 
+   }());
+ 
+   // Sign with a key
+   dummy(function()
+   {
+     function precheck()
+     {
+       if(privatekey === null) {
+         alert("Private key has not been set up");
+         return false;
+       } else {
+         return true;
+       }
+     }
+ 
+     const privkey = doele("span", {"class": "privkey"}, "", null);
+     privkeys.push(privkey);
+ 
+     document.getElementById("sk_screen").appendChild(
+       doele("div", {}, "", [
+         gettentry("Private key status:", [privkey]),
+         getsigpage(precheck)
+       ]));
+   }());
+ 
+   // Verify signature
+   dummy(function()
+   {
+     const fingureprint = doele("span", {"class": "fingureprint"}, "", null);
+     const publickey = doele("input", {"class": "publickey", type: "text", name: "publickey"}, "", null);
+ 
+     publickey.addEventListener("blur", function(e)
+     {
+       let fld = e.target;
+       if(fld.value.trim() == "") {
+         fingureprint.innerText = "";
+         return;
+       }
+ 
+       let pass = true;
+ 
+       try {
+         let arr = FromBase64.process(fld.value);
+         if(arr.length < 16) {
+           throw("Too small for a public key");
+         }
+         fingureprint.innerText = to_fingureprint(arr.slice(1));
+       } catch(err) {
+         alert(err);
+         pass = false;
+       }
+       if(!pass) {
+         fld.value = "";
+         fingureprint.innerText = "";
+         return;
+       }
+ 
+     });
+ 
+     function precheck()
+     {
+       if(publickey.value == "") {
+         alert("Sender's public key not entered");
+         return false;
+       } else {
+         return true;
+       }
+     }
+ 
+     let spubkey = null;
+     let spoint = null;
+ 
+     function getpub()
+     {
+       const wpubkey = publickey.value;
+       if(wpubkey != spubkey) {
+         spubkey = wpubkey;
+         spoint = EC.Point.fromArray(curve, FromBase64.process(publickey.value));
+       }
+       return spoint;
+     }
+ 
+     document.getElementById("ve_screen").appendChild(
+       doele("div", {}, "", [
+         gettentry("Sender's public key:", [publickey]),
+         gettentry("Sender's public key fingureprint:", [fingureprint]),
+         getverifypage(precheck, getpub)
+       ]));
+   }());
+ 
+ 
+   function gettentry(title, fields, fields2)
+   {
+     const oline = [];
+     if(title) oline.push(doele("div", {"class": "ttitle"}, title, null));
+     oline.push(doele("div", {"class": "tfield"}, "", fields));
+     if(fields2) {
+       oline.push(doele("div", {"class": "tfield"}, "", fields2));
+     }
+     return doele("div", {"class": "tentry"}, "", oline);
+   }
+ 
+ 
+   function getmessorfile(messscreen, filescreen)
+   {
+ 
+     const butmessage = doele("input", {type: "button", value: "Messages"}, "", null);
+     const butfile = doele("input", {type: "button", value: "Files"}, "", null);
+ 
+     messscreen.style.display = "block";
+     filescreen.style.display = "none";
+   
+     butmessage.style.fontWeight = "bold"
+     butfile.style.fontWeight = "normal"
+   
+     butmessage.addEventListener("click", function(e) {
+       messscreen.style.display = "block";
+       filescreen.style.display = "none";
+       butmessage.style.fontWeight = "bold"
+       butfile.style.fontWeight = "normal"
+     });
+   
+     butfile.addEventListener("click", function(e) {
+       messscreen.style.display = "none";
+       filescreen.style.display = "block";
+       butmessage.style.fontWeight = "normal"
+       butfile.style.fontWeight = "bold"
+     });
+ 
+ 
+     return doele("div", {}, "", [
+       gettentry(null, [butmessage, butfile]),
+       messscreen,
+       filescreen
+     ]);
+   }
+ 
+   function getcodepage(dokey, precheck, doonchoose)
+   {
+     const intext = doele("textarea", {cols: 40, rows: 15, name:"intext"}, "", null);
+   
+     function getcipher(cname) {
+       return doele("select", {name: cname}, "", [
+             doele("option", {value: 1}, "OFB", null),
+             doele("option", {value: 2, selected: "yes"}, "CFB", null),
+             doele("option", {value: 3}, "CTR", null),
+             doele("option", {value: 4}, "CBC", null),
+             doele("option", {value: 5}, "PCBC", null),
+             doele("option", {value: 6}, "CTRB", null)
+           ]);
+     }
+   
+     const cipher = getcipher("cipher");
+   
+     const compress = doele("input", {type: "checkbox", value: false, name: "compress"});
+     const encrypt = doele("input", {type: "button", value: "Encrypt"});
+     const decrypt = doele("input", {type: "button", value: "Decrypt"});
+     const outtext = doele("textarea", {cols: 40, rows: 15, name:"outtext", readonly: "yes"}, "", null);
+   
+   
+     const infile = doele("input", {type: "file", name: "infile"}, "", null);
+     const fcipher = getcipher("fcipher");
+   
+     const fencrypt = doele("input", {type: "button", value: "Encrypt"});
+     const fdecrypt = doele("input", {type: "button", value: "Decrypt"});
+   
+     const outsave = doele("button", {type: "button", disabled: true}, "Save", null);
+     const outfile = doele("a", {href: "#", download: "", name: "outfle", "class": "download"}, "", [outsave]);
+   
+   
+     const messscreen = doele("div", {"class": "optscreen"}, "", [
+       gettentry("Input", [intext]),
+       gettentry(null, [
+         doele("div", {"class": "tfield"}, "", [
+           cipher,
+           compress,
+           doele("span", {}, " Compress? ", null),
+           encrypt, decrypt,
+         ])
+       ]),
+       gettentry("output", [outtext])
+     ]);
+   
+     const filescreen = doele("div", {"class": "optscreen"}, "", [
+       gettentry(null, [infile]),
+       gettentry(null, [
+           fcipher,
+           fencrypt,
+           fdecrypt
+       ]),
+       gettentry(null, [outfile])
+     ]);
+   
+     encrypt.addEventListener("click", function(e) {
+       if(!precheck()) return;
+   
+       const iv = entropy.getblock();
+       iv[0] = 1;
+       iv[1] = Number(cipher.value) << 5;
+   
+       let outbss = [];
+       function _out(blk)
+       {
+         for(let b of blk) outbss.push(b);
+       }
+       let blk = AES.getEncode(Number(cipher.value), dokey(), _out);
+     
+       let cls;
+       if(compress.checked)
+         cls = ToBaseBMP;
+       else
+         cls = ToBase64;
+    
+       function _in(b)
+       {
+         blk.put_byte(b);
+       }
+       fromUTF16(_in, intext.value);
+       blk.end();
+       outtext.value = cls.process(outbss);
+     });
+   
+     decrypt.addEventListener("click", function(e) {
+   
+       if(!precheck()) return;
+   
+       function getFromBasePK(str)
+       {
+         let slen = str.length;
+         let i = 0;
+   
+         for(;;)
+         {
+           if(i >= slen) {
+             break;
+           }
+           let s = str.charCodeAt(i);
+           if(s <= 32) continue;
+     
+           if(s >= 0x100) {
+             return FromBaseBMP;
+           } else  {
+             return FromBase64;
+           }
+         }
+         alert("No input");
+         return null;
+       }
+   
+       const cls = getFromBasePK(intext.value.trim());
+   
+       if(cls === null) return; 
+   
+       if(cls instanceof FromBaseBMP) {
+         compress.checked = true;
+       } else {
+         compress.checked = false;
+       }
+    
+       let inpbbs = cls.process(intext.value);
+       let outbbs = [];
+    
+       function _out(arr)
+       {
+         for(let b of arr) outbbs.push(b);
+       }
+       let blk = AES.getDecode(dokey(), _out, inpbbs);
+       cipher.value = blk.ciphernum.toString();
+    
+       blk.put_bytes(inpbbs);
+       blk.end();
+    
+       let outstr = "";
+       function _ostr(_chr)
+       {
+         outstr += _chr;
+       }
+       toUTF16(_ostr, outbbs);
+       outtext.value = outstr;
+     });
+   
+   
+     fencrypt.addEventListener("click", function(e)
+     {
+       if(!precheck()) return;
+       file.encrypt(dokey(), Number(cipher.value));
+     });
+     
+     fdecrypt.addEventListener("click", function(e)
+     {
+       if(!precheck()) return;
+       file.decrypt(dokey(), cipher);
+     });
+ 
+     return getmessorfile(messscreen, filescreen);
+   }
+   
+   function getsigpage(precheck)
+   {
+     const intext = doele("textarea", {cols: 40, rows: 15, name:"intext"}, "", null);
+     const butsign = doele("input", {"class": "opbutton", type: "button", value: "Sign"}, "", null);
+     const fbutsign = doele("input", {"class": "fopbutton", type: "button", value: "Sign"}, "", null);
+   
+     const infile = doele("input", {type: "file", name: "infile"}, "", null);
+     const signature = doele("textarea", {"class": "signature", cols: 40, rows: 5, name: "signature", readonly: true}, "", null);
+     const fsignature = doele("textarea", {"class": "signature", cols: 40, rows: 5, name: "fsignature", readonly: true}, "", null);
+ 
+     const messscreen = doele("div", {"class": "optscreen"}, "", [
+       gettentry("Input", [intext]),
+       gettentry(null, [butsign]),
+       gettentry("Signature", [signature])
+     ]);
+ 
+ 
+     const filescreen = doele("div", {"class": "optscreen"}, "", [
+       gettentry(null, [infile]),
+       gettentry(null, [fbutsign]),
+       gettentry("Signature", [fsignature])
+     ]);
+ 
+     const file = new File(infile, null, null, function() {fsignature.value = "";});
+   
+     butsign.addEventListener("click", function(e) {
+       signature.value = "";
+       if(!precheck()) return;
+ 
+       const sha = new SHA256();
+       sha.write_field(intext.value);
+       signature.value = ToBase64.process(privatekey.sign(sha.finalize().toByteArray()).toArray());
+     });
+   
+     fbutsign.addEventListener("click", function(e) {
+   
+       signature.value = "";
+       if(!precheck()) return;
+       if(file.mode != 1) {
+         alert("File needs to be read");
+         return;
+       }
+       const sha = new SHA256();
+       sha.putbytes(file.data);
+       fsignature.value = ToBase64.process(privatekey.sign(sha.finalize().toByteArray()).toArray());
+     });
+     return getmessorfile(messscreen, filescreen);;
+   }
+   
+   function getverifypage(precheck, getpub)
+   {
+     const intext = doele("textarea", {cols: 40, rows: 15, name:"intext"}, "", null);
+     const butverify = doele("input", {"class": "opbutton", type: "button", value: "Verify"}, "", null);
+     const fbutverify = doele("input", {"class": "fopbutton", type: "button", value: "Verify"}, "", null);
+ 
+     const response = doele("span", {"class": "verifyresponse"}, "", null);
+     const fresponse = doele("span", {"class": "verifyresponse"}, "", null);
+   
+     const infile = doele("input", {type: "file", name: "infile"}, "", null);
+     const signature = doele("textarea", {"class": "signature", cols: 40, rows: 5, name: "signature"}, "", null);
+     const fsignature = doele("textarea", {"class": "signature", cols: 40, rows: 5, name: "fsignature"}, "", null);
+ 
+     const messscreen = doele("div", {"class": "optscreen"}, "", [
+       gettentry("Input", [intext]),
+       gettentry("Signature", [signature]),
+       gettentry(null, [butverify, response])
+     ]);
+ 
+     const filescreen = doele("div", {"class": "optscreen"}, "", [
+       gettentry(null, [infile]),
+       gettentry("Signature", [fsignature]),
+       gettentry(null, [fbutverify, fresponse])
+     ]);
+ 
+     const file = new File(infile, null, null, function()
+       {
+         fresponse.innerText = "";
+         response.style.color = "black";
+       });
+ 
+     intext.addEventListener("blur", function(e) {
+       response.innerText = "";
+       response.style.color = "black";
+     });
+     signature.addEventListener("blur", function(e) {
+       response.innerText = "";
+       response.style.color = "black";
+     });
+     fsignature.addEventListener("blur", function(e) {
+       fresponse.innerText = "";
+       response.style.color = "black";
+     });
+ 
+ 
+     butverify.addEventListener("click", function(e) {
+       response.innerText = "";
+       if(!precheck()) return;
+       if(signature.value == "") {
+         alert("Signature needs to be entered");
+       }
+ 
+       const sha = new SHA256();
+       sha.write_field(intext.value);
+       doval(sha, signature.value, response)
+     });
+   
+     fbutverify.addEventListener("click", function(e) {
+   
+       fresponse.innerText = "";
+       response.style.color = "black";
+       if(!precheck()) return;
+       if(fsignature.value == "") {
+         alert("Signature needs to be entered");
+       }
+ 
+       if(file.mode != 1) {
+         alert("File needs to be read");
+         return;
+       }
+ 
+       const sha = new SHA256();
+       sha.putbytes(file.data);
+       doval(sha, fsignature.value, fresponse)
+     });
+ 
+     function doval(sha, sig, resp)
+     {
+       try {
+         if((EC.Signature.fromArray(FromBase64.process(sig))).verify(sha.finalize().toByteArray(), getpub())) {
+           resp.innerText = " VALID :-)";
+           resp.style.color = "green";
+         } else {
+           resp.innerText = " INVALID :-(";
+           resp.style.color = "red";
+         }
+       } catch(err) {
+         console.trace();
+         alert("Error signing - details: " + err.toString());
+       }
+     }
+     return getmessorfile(messscreen, filescreen);
+   }
+   
+   
+   function doele(etype, eatts, etext, children, etail)
+   {
+     // Helper for creatin elements
+     // args:
+     //    tag (defaults to div)
+     //    attributes (Object, or if string the class)
+     //    text
+     //    children (as an array, if applicable)
+     //    tail - Text after the tag
+   
+     if (typeof etype == "undefined") etype = "div";
+     if (typeof eatts == "undefined") eclass = "";
+     else if(typeof eatts == "string") eatts = {class: eatts};
+     if (typeof etext == 'undefined') etext = "";
+     if (typeof etail == 'undefined') etail = "";
+     var ele = document.createElement(etype);
+     if (typeof eatts == "object") {
+       for (var key in eatts) {
+         ele.setAttribute(key, eatts[key]);
+       }
+     }
+     if(etext != "")
+       ele.appendChild(document.createTextNode(etext));
+   
+     if(children) {
+       if (typeof children == "object") {
+         for(var child of children) {
+           if (child)
+             ele.appendChild(child);
+         }
+       }
+     }
+     // if(etail != "")
+       // ele.appendChild(document.createTextNode(etail));
+     return ele;
+   }
+ }
+</script>
+
+    </head>
+    <body onload="do_onload();")>
+        <div id="ii_intro">
+            <h2>IM Crypt Routines</h2>
+            <div>Welcome to the IM Crypt page.  This is entirely self contained cryptography program.  There is no
+                 network or external links or dependancies.  You can "download" this page and run it from your local
+                 disk or storage, even with networking switched off.  In fact, "downloading" this to a file and loading it locally
+                 is recommended.</div>
+                <hr />
+                <div>
+                This does not use any of the browser crypto libraries, but implements it's own routines using pure Javascript.
+                The prime motivation for writing this was to show how futile trying to inhibit crypto use through legislation is.  For
+                that reason a goal of this is to have it be able to run on as many machines as posible, including phones.  Therefore
+                the smaller screen is accomodated in the design, and it may look a bit wierd on the desktop, but it should still work there.</div>
+                <hr />
+                <div>NOTE: This uses it's own "entropy" random generation routine.  To initialize this it is required that you click or tap on this message a
+                     number of times (30 times should do it but can be more), but at "irregular" intervals.  Maybe "tap" in time to a
+                    random "tune" or something similar.  If you are using a mouse it helps to move that around too.</div>
+                <hr />
+                <div>
+                <span id="ii_span">30 'taps' to go: </span><input type="button" value="Tap message to enable" id="ii_continue" disabled=true />
+                </div>
+        </div>
+        <div id="ii_rest">
+            <form name="mainmenu" target="#" method="get">
+                <div>
+                    <select name="mainoptions" id="mm_options">
+                        <option value="chooseone" selected=true>Please select option...</option>
+                        <option value="sharedsecret">Shared Secret AD-HOC Communication</option>
+                        <option value="publickey">Key: Set up Private/Public Key</option>
+                        <option value="pubencrypt">Key: Encrypt/Decrypt Messages</option>
+                        <option value="signkey">Key: Sign a message with your key</option>
+                        <option value="verify">Key: Verify Signature</option>
+                    </select>
+                </div>
+            </form>
+            <div id="opt_screens" class="optdiv">
+                <div id="opt_sharedsecret">
+                    <div>Encryption using a "one off key" derived from shared secrets between yourself and the partner(s) of this conversation.
+                         All participants enter the same secret text and password, and then all can decrypt each others
+                         encrypted messages and files.  </div>
+                    <hr />
+                    <form name="ssform" target="#" method="get" id="ss_screen"></form>
+                </div>
+                <div id="opt_publickey" class="optdiv">
+                    <hr />
+                    <div>Public key cryptography.  To use this functionality you need: </div>
+                    <ul>
+                        <li> A "Private Key" (Derived from the entered secrets here) which you keep secret.</li>
+                        <li> A "Public Key" (Calculated from the Private Key) which you publish to everyone</li>
+                    </ul>
+                    <div>There is no practical way anyone can reverse engineer the "Private Key" from the "Public" one.  
+                         However, it is important not to disclose your secrets here to anyone.  No exceptions.  Ever.
+                     </div>
+                    <hr />
+                    <form name="pkform" target="#" method="get" id="pk_screen"></form>
+                </div>
+                <div id="opt_pubencrypt" class="optdiv">
+                    <div>Public key encryption.  For this to work you need to have set your private key,
+                         and to place your conversation partner's public key here, and your partner will
+                         need their own private key and your public one.  Then only yourself
+                         and your conversation partner can read the encrypted messages. Neither of you
+                         need, nor should, share your private key or secrets.
+                         </div>
+                    <hr />
+                    <form name="peform" target="#" method="get" id="pe_screen"></form>
+                </div>
+                <div id="opt_signkey" class="optdiv">
+                    <div>Key signing.  This creates a "digital signature" from a message using your private key. 
+                         This message and signature can then be "validated" using your public key. If valid, the
+                         recipient can assume the message must have come from you as the only way the signature could have been
+                         created is with the use of your private key, and only you should have access to that.
+                         </div>
+                    <hr />
+                    <form name="skform" target="#" method="get" id="sk_screen"></form>
+                </div>
+                <div id="opt_verify" class="optdiv">
+                    <div>Signature Verification. Used to verify a signature signed in the sender's "Sign with Key"
+                         facility.
+                         </div>
+                    <hr />
+                    <form name="veform" target="#" method="get" id="ve_screen"></form>
+                </div>
+            </div>
+        </div>
+        <div id="debug"></div>
+    </body>
+</html>
