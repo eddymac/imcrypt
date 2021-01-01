@@ -3221,12 +3221,61 @@ Public/Private Key - Eliptical Curve secp256k1 - then ECDH and ECDSA
            throw("Generator poin has x or y out of range");
        }
 
-       sign(hashnum)
+       signconsistent(hasharray)
+       {
+         /*
+             Probably overkill, SHA256 with secret probably would have done
+             but this is specified to be unpredictable without knowing
+             the key (secret)
+         */
+
+         // Assume hashnum is 32 bytes long from a SHA256 hash
+         if(hasharray.length != 32) {
+             alert("Expected 32 byte array for signconsistent");
+             throw("Expected 32 byte array for signconsistent");
+         }
+
+         const key = this.secret.toArray();
+         if(key.length > 32) key.length = 32;
+         while(key.length < 32) key.push(1);
+
+         const aarray = new Array(16);
+         const barray = new Array(16);
+         for(let i = 0; i < 16; i++) aarray[i] = hasharray[i];
+         for(let i = 0; i < 16; i++) barray[i] = hasharray[i+16];
+
+         let cnt = 0;
+            
+         const geti = function()
+         {
+           // Ensure no "flipping" (Minimal chance, but all the same)
+           cnt += 1;
+           cnt &= 0x00ff;
+           aarray[0] ^= cnt;
+           barray[0] ^= cnt;
+
+           const aes = new AES.AES(key);
+           aes.cipher(aarray);
+           aes.cipher(barray);
+           const out = new Array(32);
+           for(let i = 0; i < 16; i++) {
+             out[i] = aarray[i];
+             out[16 + i] = barray[i];
+           }
+           return out;
+         }
+         return this.sign(hasharray, geti);
+       }
+
+       sign(hashnum, geti)
        {
          // Signs hashnum with private key
 
-
          const self = this;
+
+         if(!geti) {
+            geti = function() {return entropy.gethash();};
+         }
 
          if(!(hashnum instanceof LBigint)) hashnum = new LBigint(hashnum);
 
@@ -3242,7 +3291,8 @@ Public/Private Key - Eliptical Curve secp256k1 - then ECDH and ECDSA
            let num_k;
            for(;;)
            {
-             num_k = new LBigint(entropy.gethash());
+             num_k = new LBigint(geti());
+             // num_k = new LBigint(entropy.gethash());
              if(num_k.cmp(gorder) < 0) break;
            }
            point_r = this.curve.generator.multiply(num_k);
@@ -4032,6 +4082,8 @@ Public/Private Key - Eliptical Curve secp256k1 - then ECDH and ECDSA
        gettentry(null, [outfile])
      ]);
 
+     const file = new File(infile, outfile, outsave, function() { });
+
      encrypt.addEventListener("click", function(e) {
        if(!precheck()) return;
 
@@ -4166,7 +4218,7 @@ Public/Private Key - Eliptical Curve secp256k1 - then ECDH and ECDSA
 
        const sha = new SHA256();
        sha.write_field(intext.value);
-       signature.value = ToBase64.process(privatekey.sign(sha.finalize().toByteArray()).toArray());
+       signature.value = ToBase64.process(privatekey.signconsistent(sha.finalize().toByteArray()).toArray());
      });
 
      fbutsign.addEventListener("click", function(e) {
@@ -4179,7 +4231,7 @@ Public/Private Key - Eliptical Curve secp256k1 - then ECDH and ECDSA
        }
        const sha = new SHA256();
        sha.putbytes(file.data);
-       fsignature.value = ToBase64.process(privatekey.sign(sha.finalize().toByteArray()).toArray());
+       fsignature.value = ToBase64.process(privatekey.signconsistent(sha.finalize().toByteArray()).toArray());
      });
      return getmessorfile(messscreen, filescreen);;
    }
