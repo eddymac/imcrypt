@@ -5,7 +5,7 @@ with Instant Messaging programs, such as Twitter, Facebook Messanger, and even
 Reddit and the such.
 
 The prime motivation for writing this is to demonstrate how futile attempting
-to pohibit use of ncryption technologis through legislation is. It also though
+to pohibit use of encryption technologis through legislation is. It also though
 has more practical uses, including assisting in educating people regarding
 encryption. It can also be used for privacy and authentication where no other
 method is available.
@@ -47,3 +47,10 @@ Eliptic Curve secp256k1 for the private/public key mechanism, then ECDH and ECDS
 Various block ciphers user can choose for encryption, including OFB, CFB. CTR,
 CBC and PCBC, as well as a special one "CTRB" which is like CTR except it XORs
 before ciphering rather than after.
+
+
+VERSION 2: Fixed some bugs with the SHA256 routines.  This may mess things up with
+private and public keys, especially if long text strings used.  Although the old code
+did not make the program insecure, it is best if the correct routine is used.  As a result this makes
+version 1 obsolete, and all instances of it should be removed, and if public keys, or shared keys, are different
+on version 2 they should be re-distributed.  Sorry.
